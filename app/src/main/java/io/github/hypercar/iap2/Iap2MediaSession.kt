@@ -1,0 +1,209 @@
+package io.github.hypercar.iap2
+
+/** One authenticated CSM transport owns its components, descriptors and key edges. */
+internal class Iap2MediaSession(private val log: (String) -> Unit, private val key: (Int) -> Unit, private val nowMillis: () -> Long = { System.nanoTime() / 1_000_000L }) {
+    private val components = linkedSetOf<Int>()
+    private val devices = mutableMapOf<Int, ConsumerReport>()
+    private val deferred = ArrayDeque<Iap2Csm.Frame>()
+    private var identified = false
+    private var ready = false
+    private var diagnostics = 0
+    private var lastDiagnostics = nowMillis()
+    private var starts = 0L
+    private var reports = 0L
+    private var stops = 0L
+    private var rejected = 0L
+    private var parsedReports = 0L
+    private var keyEdges = 0L
+    private var replaying = false
+    val registeredCount: Int get() = devices.size
+
+    private var voiceDown = false
+    private fun releaseVoice() {
+        if (voiceDown) { voiceDown = false; key(ConsumerReport.VOICE_UP) }
+    }
+    private fun dispatch(edges: List<Int>) {
+        edges.filter { it != ConsumerReport.VOICE_DOWN && it != ConsumerReport.VOICE_UP }.forEach(key)
+        val down = devices.values.any { it.voicePressed }
+        if (down != voiceDown) {
+            voiceDown = down
+            key(if (down) ConsumerReport.VOICE_DOWN else ConsumerReport.VOICE_UP)
+        }
+    }
+
+    fun identify(hids: List<Iap2Messages.HidComponent>) {
+        val next = hids.filter { it.function == 1 }.take(32).map { it.identifier }.toSet()
+        if (identified && components != next) { releaseVoice(); devices.clear(); deferred.clear() }
+        identified = true
+        components.clear()
+        components.addAll(next)
+        note("declared media components=$components; AirPlay HID is independent")
+    }
+    fun authenticated() {
+        ready = true
+        val queued = deferred.toList(); deferred.clear()
+        replaying = true
+        try { queued.forEach(::handle) } finally { replaying = false }
+    }
+    /** Link-only resync keeps the business auth context; reports require a new StartHID. */
+    fun restartLink() { releaseVoice(); devices.clear(); deferred.clear() }
+    fun reset() { restartLink(); components.clear(); identified = false; ready = false }
+
+    fun handle(frame: Iap2Csm.Frame): Boolean {
+        if (frame.messageId !in 0x6800..0x6803 || frame.messageId == 0x6801) return false
+        if (!replaying) when (frame.messageId) {
+            0x6800 -> starts++
+            0x6802 -> reports++
+            0x6803 -> stops++
+        }
+        diagnosticsTick()
+        val params = Iap2Csm.parseParams(frame.body)
+        if (params.sumOf { it.value.size + 4 } != frame.body.size || params.count { it.id == 0 } != 1 ||
+            params.first { it.id == 0 }.value.size != 2) {
+            rejected++; note("reject reason=invalid-parameters id=0x${frame.messageId.toString(16)} bytes=${frame.body.size}"); return true
+        }
+        val component = params.first { it.id == 0 }.value.let { ((it[0].toInt() and 255) shl 8) or (it[1].toInt() and 255) }
+        if (identified && component !in components) {
+            rejected++; note("reject component=$component reason=undeclared-component bytes=${frame.body.size}")
+            return false // Do not interpret keyboards/touch as media.
+        }
+        if (!ready || !identified) {
+            if (deferred.size < 64 && frame.body.size <= 8192) deferred += frame
+            else { rejected++; note("reject reason=deferred-overflow component=$component bytes=${frame.body.size}") }
+            note("deferred component=$component identified=$identified authenticated=$ready queued=${deferred.size}")
+            return true
+        }
+        when (frame.messageId) {
+            0x6800 -> {
+                val descriptor = params.singleOrNull { it.id == 4 }?.value
+                val parsed = descriptor?.let(ConsumerReport::parse)
+                if (parsed == null) { rejected++; devices.remove(component); dispatch(emptyList()); note("StartHID component=$component descriptorBytes=${descriptor?.size ?: 0} reason=invalid-or-unsupported-descriptor"); return true }
+                if (devices[component]?.descriptor?.contentEquals(descriptor) != true) devices[component] = parsed
+                dispatch(emptyList())
+                note("StartHID component=$component descriptor=${descriptor.size}B registered; no fabricated DeviceHIDReport")
+            }
+            0x6802 -> {
+                val report = params.singleOrNull { it.id == 1 }?.value
+                val device = devices[component]
+                if (device == null || report == null) { rejected++; note("report component=$component bytes=${report?.size ?: 0} reason=${if (device == null) "not-registered" else "missing-or-duplicate-report-parameter"}"); return true }
+                val reason = device.reportRejection(report)
+                if (reason != null) { rejected++; note("report component=$component bytes=${report.size} reason=$reason"); return true }
+                val edges = device.report(report)
+                parsedReports++; keyEdges += edges.size
+                note("report component=$component bytes=${report.size} result=parsed edges=${edges.size}")
+                runCatching { dispatch(edges) }.onFailure { note("dispatch failed component=$component error=${it.javaClass.simpleName}") }
+            }
+            0x6803 -> { devices.remove(component); dispatch(emptyList()); note("StopHID component=$component") }
+        }
+        return true
+    }
+    val diagnosticSummary: String get() = "rx_6800=$starts rx_6802=$reports hid_parsed=$parsedReports hid_edges=$keyEdges"
+
+    /** Called by the transport poll even when no HID reports arrive. */
+    fun diagnosticsTick() {
+        val now = nowMillis()
+        if (now - lastDiagnostics < 10_000) return
+        lastDiagnostics = now
+        diagnostics = 0
+        log("IAP2-MEDIA: summary starts=$starts reports=$reports stops=$stops parsed=$parsedReports rejected=$rejected edges=$keyEdges registered=${devices.size} declared=${components.size} queued=${deferred.size} identified=$identified authenticated=$ready")
+    }
+    private fun note(text: String) { if (diagnostics++ < 16) log("IAP2-MEDIA: $text") }
+}
+
+/** Strict descriptor-driven Consumer decoder. No direct-usage/04 guess for iAP2. */
+internal class ConsumerReport private constructor(val descriptor: ByteArray) {
+    private data class Globals(var page: Int = 0, var size: Int = 0, var count: Int = 0, var id: Int = 0, var min: Long = 0)
+    private data class Field(val id: Int, val offset: Int, val size: Int, val count: Int, val variable: Boolean, val min: Long, val usages: List<Long>)
+    private val fields = mutableListOf<Field>()
+    private val pressed = mutableMapOf<Int, Set<Int>>()
+    private val lengths = mutableMapOf<Int, Int>()
+    private var numbered = false
+    val voicePressed: Boolean get() = pressed.values.any { VOICE_DOWN in it }
+    fun reportRejection(bytes: ByteArray): String? {
+        if (bytes.size > 4097) return "oversize-report"
+        val id = if (numbered) bytes.firstOrNull()?.toInt()?.and(255) ?: return "missing-report-id" else 0
+        val required = lengths[id] ?: return "unknown-report-id"
+        if ((bytes.size - if (numbered) 1 else 0) * 8 < required) return "short-report"
+        if (fields.none { it.id == id }) return "no-consumer-fields"
+        return null
+    }
+    fun report(bytes: ByteArray): List<Int> {
+        if (reportRejection(bytes) != null) return emptyList()
+        val id = if (numbered) bytes[0].toInt() and 255 else 0
+        val shift = if (numbered) 1 else 0
+        val selected = fields.filter { it.id == id }
+        val down = linkedSetOf<Int>()
+        for (f in selected) for (i in 0 until f.count) {
+            var value = 0L
+            for (b in 0 until f.size) {
+                val bit = f.offset + i * f.size + b
+                value = value or (((bytes[shift + bit / 8].toInt() ushr (bit % 8)) and 1).toLong() shl b)
+            }
+            val usage = if (f.variable) {
+                if (value == 0L) continue
+                f.usages.getOrNull(i) ?: f.usages.lastOrNull()
+            } else f.usages.getOrNull((value - f.min).takeIf { it in 0..Int.MAX_VALUE }?.toInt() ?: continue)
+            if (usage != null && usage ushr 16 == 0x0cL && (usage.toInt() and 0xffff) in supported) down += usage.toInt() and 0xffff
+        }
+        val wasVoicePressed = voicePressed
+        val edges = (down - pressed.getOrDefault(id, emptySet())).toMutableList()
+        pressed[id] = down
+        if (wasVoicePressed && !voicePressed) edges += VOICE_UP
+        return edges
+    }
+    companion object {
+        const val VOICE_DOWN = 0xcf
+        const val VOICE_UP = 0x100cf // Internal edge marker, never a wire usage.
+        private val supported = setOf(0xb0, 0xb1, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb9, 0xcd, VOICE_DOWN)
+        fun parse(bytes: ByteArray): ConsumerReport? = runCatching {
+            require(bytes.isNotEmpty() && bytes.size <= 4096)
+            val result = ConsumerReport(bytes.copyOf())
+            var g = Globals(); val stack = ArrayDeque<Globals>()
+            val usages = mutableListOf<Long>(); var range: Long? = null
+            var at = 0
+            while (at < bytes.size) {
+                val prefix = bytes[at++].toInt() and 255
+                if (prefix == 254) {
+                    require(at + 2 <= bytes.size)
+                    val size = bytes[at].toInt() and 255
+                    at += 2 + size; require(at <= bytes.size); continue
+                }
+                val size = if (prefix and 3 == 3) 4 else prefix and 3
+                require(at + size <= bytes.size)
+                var value = 0L
+                repeat(size) { value = value or ((bytes[at++].toLong() and 255) shl (it * 8)) }
+                val type = (prefix ushr 2) and 3; val tag = prefix ushr 4
+                fun usage(v: Long) = if (size == 4) v else (g.page.toLong() shl 16) or v
+                when (type to tag) {
+                    1 to 0 -> { require(value <= 65535); g.page = value.toInt() }
+                    1 to 1 -> g.min = when (size) { 1 -> value.toByte().toLong(); 2 -> value.toShort().toLong(); else -> value.toInt().toLong() }
+                    1 to 7 -> { require(value in 1..32); g.size = value.toInt() }
+                    1 to 8 -> { require(value in 1..255); g.id = value.toInt(); result.numbered = true }
+                    1 to 9 -> { require(value <= 256); g.count = value.toInt() }
+                    1 to 10 -> { require(stack.size < 16); stack += g.copy() }
+                    1 to 11 -> { require(stack.isNotEmpty()); g = stack.removeLast() }
+                    2 to 0 -> { require(usages.size < 512); usages += usage(value) }
+                    2 to 1 -> range = usage(value)
+                    2 to 2 -> {
+                        val first = requireNotNull(range); val last = usage(value)
+                        require(last >= first && last - first <= 511 && usages.size + last - first + 1 <= 512)
+                        usages.addAll(first..last); range = null
+                    }
+                    0 to 8 -> {
+                        require(g.size in 1..32 && g.count in 1..256)
+                        val offset = result.lengths[g.id] ?: 0
+                        val end = offset + g.size * g.count
+                        require(end <= 32768); result.lengths[g.id] = end
+                        if (value and 1 == 0L && usages.any { it ushr 16 == 0x0cL }) {
+                            require(result.fields.size < 64)
+                            result.fields += Field(g.id, offset, g.size, g.count, value and 2 != 0L, g.min, usages.toList())
+                        }
+                    }
+                }
+                if (type == 0) { usages.clear(); range = null }
+            }
+            require(result.fields.isNotEmpty())
+            result
+        }.getOrNull()
+    }
+}

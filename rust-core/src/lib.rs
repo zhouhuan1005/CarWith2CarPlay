@@ -1,0 +1,1015 @@
+//! HyperCar 核心层 —— JNI 入口、Tokio 运行时、引擎生命周期。
+//!
+//! 与「参考文档」的架构差异（docs/NEGOTIATION-GAPS.md）：
+//!  参考文档里 AirPlay 协商留在 Kotlin，Rust 只接「已连通 FD + 已派生密钥」；
+//!  本项目把协商整体下沉到 Rust（/info → pair-verify → SETUP → RECORD → 心跳），
+//!  Kotlin 只提供「绑定车机网络的 socket FD 供给器」——协商状态机只有一份实现。
+//!
+//! JNI 命名对应 io.github.hypercar.core.RustCoreBridge（下划线式导出名）。
+//!
+
+mod airplay;
+mod nbt;
+mod negotiation_cleanup;
+mod audio_out;
+mod audio_diagnostics;
+mod audio_pacing;
+mod audio_resample;
+mod aac;
+mod opus;
+mod opus_encode;
+mod speech_resource;
+mod aux_audio;
+mod aux_setup;
+mod mic_probe;
+mod audio_resource;
+mod bplist;
+mod consumer_hid;
+mod voice_key;
+mod crypto;
+mod carlife;
+mod carwith_source;
+mod engine;
+mod modes;
+mod pairing;
+mod rtsp;
+mod resource_trace;
+mod rtsp_uri;
+mod screen;
+mod screen_qos;
+mod screen_write;
+mod video_queue;
+mod h264;
+mod video_transcode;
+mod hevc;
+mod video_format;
+mod video_feedback;
+mod pipeline;
+mod tcp_diagnostics;
+mod screen_session;
+mod cluster_screen;
+mod screen_resource;
+mod srp6a;
+mod tlv8;
+mod timing;
+mod udp_keepalive;
+mod buffered_ownership;
+mod buffered_control;
+mod wifi_iap2;
+mod auth_setup;
+mod display_layout;
+mod receiver_ui;
+mod shutdown;
+mod callback_context;
+#[cfg(test)]
+mod wire_compat;
+
+use std::os::unix::io::{FromRawFd, RawFd};
+use std::sync::Arc;
+
+use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JShortArray, JString};
+use jni::sys::{jboolean, jint, jlong, JNI_FALSE, JNI_TRUE};
+use jni::JNIEnv;
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::runtime::{Builder, Runtime};
+use tokio::sync::mpsc;
+
+use crate::airplay::{SocketProvider, TouchInput};
+
+static TOKIO_RT: Lazy<Runtime> = Lazy::new(|| {
+    Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_name("hypercar-core")
+        .enable_all()
+        .build()
+        .expect("tokio runtime 创建失败")
+});
+
+static JAVA_VM: RwLock<Option<jni::JavaVM>> = RwLock::new(None);
+static LISTENER: RwLock<Option<GlobalRef>> = RwLock::new(None);
+static TRANSCODER_BRIDGE: RwLock<Option<GlobalRef>> = RwLock::new(None);
+/// 车机 HID 触摸回调（Rust → Kotlin）。
+///
+/// 与 [LISTENER] 分开持有 GlobalRef：触摸是高频事件（车机滑一下就是几十条），
+/// 不能因为 UI 层临时把 EventListener 置空而丢触摸；引擎重启不需要重装监听器。
+static TOUCH_LISTENER: RwLock<Option<GlobalRef>> = RwLock::new(None);
+
+struct EngineHandle {
+    receiver_audio_generation: Arc<std::sync::atomic::AtomicU64>,
+    voice_input: voice_key::Input,
+    shutdown: Arc<shutdown::EngineShutdown>,
+    abort: tokio::task::AbortHandle,
+    /// 自绘界面投喂给引擎的视频帧 / 音频 PCM（nativePushVideoFrame / nativePushAudioPcm）
+    source_tx: mpsc::UnboundedSender<engine::SourceEvent>,
+    carwith_source: bool,
+    /// 手机实际编码尺寸（触摸坐标目标）。与 /info 的 encoder_size 分开。
+    touch_size: Arc<parking_lot::Mutex<(u32, u32)>>,
+}
+
+// JNI start/stop must serialize even while ENGINE is temporarily taken for shutdown.
+static ENGINE_LIFECYCLE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+static ENGINE: Lazy<parking_lot::Mutex<Option<EngineHandle>>> =
+    Lazy::new(|| parking_lot::Mutex::new(None));
+
+// ---------------------------------------------------------------- 回调工具
+
+/// Rust → Kotlin 日志（经 EventListener.onLog；同时走 logcat）。
+pub(crate) fn emit_log(line: &str) {
+    log::info!("{line}");
+    call_listener("onLog", |env, obj| {
+        let jline = env.new_string(line)?;
+        env.call_method(obj, "onLog", "(Ljava/lang/String;)V", &[(&jline).into()])
+            .map(|_| ())
+    });
+}
+
+pub(crate) fn reopen_carwith_entry(owner: u64, startup: bool) {
+    call_listener("onCarWithReopen", |env, obj| {
+        env.call_method(obj, "onCarWithReopen", "(JZ)V", &[(owner as jlong).into(), jni::sys::jboolean::from(startup).into()]).map(|_| ())
+    });
+}
+
+pub(crate) fn emit_pipeline(json: &str) {
+    call_listener("onPipeline", |env,obj| {
+        let data=env.new_string(json)?;
+        env.call_method(obj,"onPipeline","(Ljava/lang/String;)V",&[(&data).into()]).map(|_| ())
+    });
+}
+
+pub(crate) fn emit_media_trace(at_ms: u64, event: &str, detail: &str) {
+    emit_log(&format!("MEDIA-TIMELINE: {at_ms} {event} {detail}"));
+}
+
+pub(crate) fn emit_event_channel(id: u64, at: u64, cause: &str, sample: Option<&tcp_diagnostics::TcpSnapshot>) {
+    let tcp = sample.and_then(|s| serde_json::to_string(s).ok()).unwrap_or_default();
+    call_listener("onEventChannel", |env,obj| {
+        let cause = env.new_string(cause)?;
+        let tcp = env.new_string(tcp)?;
+        env.call_method(obj, "onEventChannel", "(JJLjava/lang/String;Ljava/lang/String;)V",
+            &[(id as jlong).into(), (at as jlong).into(), (&cause).into(), (&tcp).into()]).map(|_| ())
+    });
+}
+
+pub(crate) fn emit_state(state: &str, detail: &str) {
+    log::info!("STATE engine={} {state}: {detail}", callback_context::current().map(|c|c.generation).unwrap_or(0));
+    call_listener("onState", |env, obj| {
+        let js = env.new_string(state)?;
+        let jd = env.new_string(detail)?;
+        env.call_method(
+            obj,
+            "onState",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[(&js).into(), (&jd).into()],
+        )
+        .map(|_| ())
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_stats(
+    fps: i32,
+    frames: i64,
+    kbps: i64,
+    audio_playing: bool,
+    ducking: bool,
+) {
+    call_listener("onStats", |env, obj| {
+        env.call_method(
+            obj,
+            "onStats",
+            // Kotlin: onStats(fps:Int, frames:Long, kbps:Long, audioPlaying:Boolean, ducking:Boolean)
+            // → I J J Z Z（5 个参数）。**必须严格 5 位**：旧值多写了一个 I（"(IJJIZZ)V"）
+            // 导致 GetMethodID 直接失败、onStats 一次都没调到——首页帧率/码率/音频芯片全空
+            // （2026-10-25 定谳）。
+            "(IJJZZ)V",
+            &[
+                fps.into(),
+                frames.into(),
+                kbps.into(),
+                jni::sys::jboolean::from(audio_playing).into(),
+                jni::sys::jboolean::from(ducking).into(),
+            ],
+        )
+        .map(|_| ())
+    });
+}
+
+/// Notify Android after a permanent receiver main-audio ownership change.
+pub(crate) fn emit_receiver_audio_take(taken: bool) {
+    call_listener("onReceiverAudioTake", |env, obj| {
+        env.call_method(obj, "onReceiverAudioTake", "(Z)V", &[taken.into()]).map(|_| ())
+    });
+}
+
+pub(crate) fn emit_media_key(usage: u32) {
+    call_listener("onMediaKey", |env, obj| {
+        env.call_method(obj, "onMediaKey", "(I)V", &[(usage as jint).into()]).map(|_| ())
+    });
+}
+
+pub(crate) fn emit_voice_assistant() {
+    call_listener("onVoiceAssistant", |env,obj| env.call_method(obj,"onVoiceAssistant","()V",&[]).map(|_| ()));
+}
+
+pub(crate) fn emit_night_mode(night: bool) {
+    call_listener("onNightMode", |env, obj| {
+        env.call_method(
+            obj,
+            "onNightMode",
+            "(Z)V",
+            &[jni::sys::jboolean::from(night).into()],
+        )
+        .map(|_| ())
+    });
+}
+
+pub(crate) fn emit_receiver_ui(kind: &str, payload: serde_json::Value) {
+    let payload = payload.to_string();
+    emit_log(&format!("RECEIVER-UI: {kind} {payload}"));
+    call_listener("onReceiverUi", |env, obj| env.with_local_frame(2, |env| {
+        let kind = env.new_string(kind)?;
+        let payload = env.new_string(payload)?;
+        env.call_method(obj, "onReceiverUi", "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[(&kind).into(), (&payload).into()]).map(|_| ())
+    }));
+}
+
+/// Route forceKeyFrame to the active producer: CarWith CMD RESET or Kotlin MediaCodec.
+pub(crate) fn emit_force_keyframe() {
+    let routed = ENGINE.lock().as_ref().map(|h| h.carwith_source &&
+        h.source_tx.send(engine::SourceEvent::RequestCarWithKeyFrame).is_ok()).unwrap_or(false);
+    if routed { return; }
+    call_listener("onForceKeyFrame", |env, obj| {
+        env.call_method(obj, "onForceKeyFrame", "()V", &[])
+            .map(|_| ())
+    });
+}
+
+pub(crate) fn emit_carwith_navigation(token:u64, update:Option<&carlife::navigation::NavigationUpdate>) {
+    if token==0 {return;}
+    let payload=update.and_then(|n|serde_json::to_string(n).ok()).unwrap_or_else(||"null".into());
+    call_listener("onCarWithNavigation", |env,obj| {
+        let data=env.new_string(payload)?;
+        env.call_method(obj,"onCarWithNavigation","(JLjava/lang/String;)V",&[(token as jlong).into(),(&data).into()]).map(|_|())
+    });
+}
+
+pub(crate) fn emit_iap2_start(id: u64, device: &str, device_name: &str, profile_id: &str) {
+    call_listener("onIap2Start", |env, obj| {
+        let name = env.new_string(device)?;
+        let display_name = env.new_string(device_name)?;
+        let profile = env.new_string(profile_id)?;
+        env.call_method(obj, "onIap2Start", "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[(id as jlong).into(), (&name).into(), (&display_name).into(), (&profile).into()]).map(|_| ())
+    });
+}
+
+pub(crate) fn emit_iap2_bytes(id: u64, bytes: &[u8]) {
+    call_listener("onIap2Bytes", |env, obj| {
+        let data = env.byte_array_from_slice(bytes)?;
+        env.call_method(obj, "onIap2Bytes", "(J[B)V", &[(id as jlong).into(), (&data).into()]).map(|_| ())
+    });
+}
+
+pub(crate) fn emit_iap2_stop(id: u64) {
+    call_listener("onIap2Stop", |env, obj| {
+        env.call_method(obj, "onIap2Stop", "(J)V", &[(id as jlong).into()]).map(|_| ())
+    });
+}
+
+pub(crate) fn emit_iap2_screen_setup_accepted(id: u64) {
+    call_listener("onIap2ScreenSetupAccepted", |env, obj| {
+        env.call_method(obj, "onIap2ScreenSetupAccepted", "(J)V", &[(id as jlong).into()]).map(|_| ())
+    });
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeWifiIap2PeerSyn(
+    _env: JNIEnv, _class: JClass, id: jlong,
+) {
+    wifi_iap2::peer_syn_accepted(id as u64);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendWifiIap2Detect(
+    _env: JNIEnv, _class: JClass, id: jlong,
+) -> jboolean {
+    if wifi_iap2::queue_startup_detect(id as u64) { JNI_TRUE } else { JNI_FALSE }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendIap2(
+    env: JNIEnv, _class: JClass, id: jlong, bytes: JByteArray, hud_message_id: jint, hud_serial: jlong,
+) -> jboolean {
+    if id <= 0 { return JNI_FALSE; }
+    match env.convert_byte_array(&bytes) {
+        Ok(data) => if wifi_iap2::send(id as u64, data, hud_message_id, hud_serial) { JNI_TRUE } else { JNI_FALSE },
+        _ => JNI_FALSE,
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeMarkWifiIap2Ready(
+    _env: JNIEnv, _class: JClass, id: jlong, ready: jboolean,
+) { wifi_iap2::mark_ready(id as u64, ready != JNI_FALSE); }
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeCanKeepWifiSession(
+    _env: JNIEnv, _class: JClass,
+) -> jboolean { if wifi_iap2::can_keep_session() { JNI_TRUE } else { JNI_FALSE } }
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetWifiIap2Phase(
+    mut env: JNIEnv, _class: JClass, id: jlong, phase: JString,
+) {
+    if let Ok(phase)=env.get_string(&phase) { wifi_iap2::set_phase(id as u64,&phase.to_string_lossy()); }
+}
+
+pub(crate) fn emit_video_capabilities(hevc_allowed:bool) {
+    call_listener("onVideoCapabilities", |env,obj| {
+        env.call_method(obj,"onVideoCapabilities","(Z)V", &[(if hevc_allowed {JNI_TRUE} else {JNI_FALSE}).into()]).map(|_|())
+    });
+}
+
+pub(crate) fn emit_display_size(width: u32, height: u32, max_fps: Option<u32>) {
+    call_listener("onDisplaySize", |env, obj| {
+        env.call_method(obj, "onDisplaySize", "(III)V", &[(width as jint).into(), (height as jint).into(), (max_fps.unwrap_or(0) as jint).into()]).map(|_| ())
+    });
+}
+
+pub(crate) fn emit_display_layout(width: u32, height: u32, layout: &display_layout::Layout, right_hand_drive: bool) {
+    let v=layout.view; let s=layout.safe;
+    call_listener("onDisplayLayout", |env,obj| {
+        env.call_method(obj,"onDisplayLayout","(IIIIIIIIIIZIZZ)V", &[
+            (width as jint).into(),(height as jint).into(),v.x.into(),v.y.into(),v.w.into(),v.h.into(),
+            s.x.into(),s.y.into(),s.w.into(),s.h.into(),(if layout.draw_outside { JNI_TRUE } else { JNI_FALSE }).into(),
+            layout.status_bar_edge.unwrap_or(-1).into(),
+            (if right_hand_drive { JNI_TRUE } else { JNI_FALSE }).into(),
+            (if layout.allows_focus { JNI_TRUE } else { JNI_FALSE }).into(),
+        ]).map(|_| ())
+    });
+}
+
+pub(crate) fn emit_view_area_choices(revision: i64, uuid: &str, targets: &[i32]) {
+    call_listener("onViewAreaChoices", |env, obj| env.with_local_frame(2, |env| {
+        let display = env.new_string(uuid)?;
+        let indices = env.new_int_array(targets.len() as jint)?;
+        env.set_int_array_region(&indices, 0, targets)?;
+        env.call_method(obj, "onViewAreaChoices", "(JLjava/lang/String;[I)V",
+            &[revision.into(), (&display).into(), (&indices).into()]).map(|_| ())
+    }));
+}
+
+fn with_env<T>(
+    f: impl FnOnce(&mut JNIEnv) -> jni::errors::Result<T>,
+) -> Option<T> {
+    let vm_guard = JAVA_VM.read();
+    let vm = vm_guard.as_ref()?;
+    // 已 attach 的线程（JNI 调用栈内 / 已挂载 worker）→ 直接用；
+    // tokio worker 线程 → daemon 挂载（进程退出不阻塞）。
+    // jni 0.21：attach_current_thread_as_daemon 返回 JNIEnv（非 AttachGuard），无需 unsafe。
+    let (mut env, owned) = match vm.get_env() {
+        Ok(env) => (env, false),
+        Err(_) => (vm.attach_current_thread_as_daemon().ok()?, true),
+    };
+    let result = f(&mut env);
+    // **必须清理 Pending Java Exception**：JNI 调用失败（如方法签名不对 / 业务异常）后，
+    // 异常会挂在这个线程上，下一次该线程的任何 JNI 调用（emit_log / openTcpFd …）都会
+    // 立即失败甚至崩——必须 exception_clear 掉（2026-10-25 加固）。
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_describe();
+        let _ = env.exception_clear();
+    }
+    // 本地引用只在本次 f 内使用；线程 attach 生命周期由 daemon 管理，无需 detach。
+    let _ = owned;
+    result.ok()
+}
+
+fn call_listener(method: &str, f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::errors::Result<()>) {
+    // Task-local capture also applies to aborted futures' destructors and panic watchers.
+    if let Some(context) = callback_context::current() {
+        if let Some(global) = context.listener.as_ref() {
+            let _ = with_env(|env| f(env, global.as_obj()));
+        }
+        return;
+    }
+    // Engine state without an owner must never terminate whichever session happens to be current.
+    if matches!(method, "onState" | "onReceiverAudioTake") { return; }
+    let guard = LISTENER.read();
+    let Some(global) = guard.as_ref() else { return };
+    let _ = with_env(|env| f(env, global.as_obj()));
+}
+
+/// Rust → Kotlin 触摸回调（action: 0=DOWN 1=UP 2=MOVE；坐标为编码画布像素）。
+///
+/// 在 Rust 工作线程调用：`with_env` 会按需 attach（daemon）并清掉 Pending 异常。
+/// 没有装监听器时直接丢弃——这样「只连车机、不跑界面」的路径也能安全工作。
+pub(crate) fn emit_touch(action: u32, x: u32, y: u32) {
+    let guard = TOUCH_LISTENER.read();
+    let Some(global) = guard.as_ref() else { return };
+    let obj = global.as_obj();
+    let _ = with_env(|env| {
+        env.call_method(
+            obj,
+            "onTouch",
+            "(III)V",
+            &[
+                (action as jint).into(),
+                (x as jint).into(),
+                (y as jint).into(),
+            ],
+        )
+        .map(|_| ())
+    });
+}
+
+// ---------------------------------------------------------------- socket 供给器
+
+/// Kotlin SocketProvider（carNetwork 绑定的 socket 工厂）→ Rust trait 实现。
+struct JniSocketProvider {
+    vm: jni::JavaVM,
+    obj: GlobalRef,
+}
+
+impl JniSocketProvider {
+    fn call_fd(&self, method: &str, host: &str, port: u16, timeout_ms: u32) -> Option<RawFd> {
+        let mut env = self.vm.attach_current_thread_as_daemon().ok()?;
+        let jhost = env.new_string(host).ok()?;
+        let fd: jint = env
+            .call_method(
+                self.obj.as_obj(),
+                method,
+                "(Ljava/lang/String;II)I",
+                &[
+                    (&jhost).into(),
+                    (port as jint).into(),
+                    (timeout_ms as jint).into(),
+                ],
+            )
+            .ok()?
+            .i()
+            .ok()?;
+        if fd < 0 {
+            None
+        } else {
+            Some(fd as RawFd)
+        }
+    }
+}
+
+impl SocketProvider for JniSocketProvider {
+    fn bind_timing_network(&self, socket: &std::net::UdpSocket) -> std::io::Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let mut env = self.vm.attach_current_thread_as_daemon().map_err(std::io::Error::other)?;
+        let bound = env.call_method(self.obj.as_obj(), "bindTimingFd", "(I)Z", &[socket.as_raw_fd().into()])
+            .and_then(|value| value.z()).map_err(std::io::Error::other)?;
+        if bound { Ok(()) } else { Err(std::io::Error::other("session Wi-Fi bind failed")) }
+    }
+
+    fn open_tcp(&self, host: &str, port: u16, timeout_ms: u32) -> Option<TcpStream> {
+        let fd = self.call_fd("openTcpFd", host, port, timeout_ms)?;
+        unsafe {
+            let std_stream = std::net::TcpStream::from_raw_fd(fd);
+            let _ = std_stream.set_nonblocking(true);
+            let _ = std_stream.set_nodelay(true);
+            TcpStream::from_std(std_stream).ok()
+        }
+    }
+
+    fn open_udp(&self, host: &str, port: u16) -> Option<UdpSocket> {
+        // 注意 Kotlin 侧 openUdpFd(host, port) 只有两个参数，签名为 (Ljava/lang/String;I)I
+        let mut env = self.vm.attach_current_thread_as_daemon().ok()?;
+        let jhost = env.new_string(host).ok()?;
+        let fd: jint = env
+            .call_method(
+                self.obj.as_obj(),
+                "openUdpFd",
+                "(Ljava/lang/String;I)I",
+                &[(&jhost).into(), (port as jint).into()],
+            )
+            .ok()?
+            .i()
+            .ok()?;
+        if fd < 0 {
+            return None;
+        }
+        unsafe {
+            let std_udp = std::net::UdpSocket::from_raw_fd(fd as RawFd);
+            let _ = std_udp.set_nonblocking(true);
+            UdpSocket::from_std(std_udp).ok()
+        }
+    }
+}
+
+// ---------------------------------------------------------------- JNI 导出
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeInitLogger(
+    env: JNIEnv,
+    bridge: JObject,
+) {
+    *JAVA_VM.write() = Some(env.get_java_vm().expect("JavaVM 获取失败"));
+    *TRANSCODER_BRIDGE.write()=env.new_global_ref(bridge).ok();
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("HyperCar-Core"),
+    );
+    // 崩溃取证：默认 panic hook 写 stderr，Android 应用进程的 stderr 基本看不到。
+    // 换成打到 logcat（tag HyperCar-Core）后，App 侧用 Shizuku 跑 `logcat -s HyperCar-Core`
+    // 就能把「哪一行 panic 的」抓进导出日志（现场 2026-10-23 20:30 崩得无声无息）。
+    // 这里只用 `log`（liblog），不碰 JNI——panic 钩子里调 JNI 有死锁风险。
+    std::panic::set_hook(Box::new(|info| {
+        log::error!("PANIC: {info}");
+    }));
+    log::info!("HyperCar Rust 核心层已初始化（协商下沉版）");
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetListener(
+    env: JNIEnv,
+    _class: JClass,
+    listener: JObject,
+) {
+    let mut guard = LISTENER.write();
+    *guard = if listener.is_null() {
+        None
+    } else {
+        Some(env.new_global_ref(listener).expect("GlobalRef 创建失败"))
+    };
+}
+
+/// 装/卸车机触摸监听器（Rust 每收到一条 HID 触摸就回调 `onTouch(action,x,y)`）。
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetTouchListener(
+    env: JNIEnv,
+    _class: JClass,
+    listener: JObject,
+) {
+    let mut guard = TOUCH_LISTENER.write();
+    *guard = if listener.is_null() {
+        None
+    } else {
+        Some(env.new_global_ref(listener).expect("TouchListener GlobalRef 创建失败"))
+    };
+}
+
+/// 启动全链路网关：controlFd（已连车机 AirPlay 端口）+ socket 供给器 + 引擎配置 JSON。
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePrepareCarWith(
+    mut env:JNIEnv, _class:JClass, json:JString, owner:jlong,
+)->jboolean {
+    let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||->Result<(),String>{
+        let text:String=env.get_string(&json).map_err(|e|e.to_string())?.into();
+        let cfg:engine::EngineConfig=serde_json::from_str(&text).map_err(|e|e.to_string())?;
+        let _entered=TOKIO_RT.enter();
+        carwith_source::prepare(owner as u64,&cfg)
+    }));
+    match result {Ok(Ok(()))=>JNI_TRUE, error=>{emit_log(&format!("CARWITH-SOURCE: prepare failed: {error:?}"));JNI_FALSE}}
+}
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStopCarWith(
+    _env:JNIEnv,_class:JClass,owner:jlong,
+) {carwith_source::stop(owner as u64);}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStart(
+    env: JNIEnv,
+    _class: JClass,
+    config_json: JString,
+    control_fd: jint,
+    socket_provider: JObject,
+) -> jboolean {
+    let _lifecycle = ENGINE_LIFECYCLE.lock();
+    let context = callback_context::Context::new(LISTENER.read().clone());
+    callback_context::sync_scope(context, || {
+        // 任何 panic 都不得越过 JNI 边界：一旦越过（哪怕 panic=unwind）Rust 会 abort 整个进程，
+        // 现场只剩「进程消失 + 内存日志全丢」。这里兜住，翻译成 JNI_FALSE + 一条日志。
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            native_start_impl(env, config_json, control_fd, socket_provider)
+        }));
+        match outcome {
+            Ok(value) => value,
+            Err(payload) => {
+                let detail = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "未知 panic".to_string());
+                emit_log(&format!("nativeStart 内部 panic（已兜住，进程未退出）：{detail}"));
+                emit_state("failed", "核心层启动时 panic（详见日志）");
+                JNI_FALSE
+            }
+        }
+    })
+}
+
+fn native_start_impl(
+    mut env: JNIEnv,
+    config_json: JString,
+    control_fd: jint,
+    socket_provider: JObject,
+) -> jboolean {
+    if control_fd < 0 {
+        emit_log("controlFd 非法");
+        return JNI_FALSE;
+    }
+    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(control_fd as RawFd) };
+    // Own the descriptor before any fallible operation; failure closes it through RAII.
+    if !stop_engine(false) {
+        emit_log("nativeStart: 旧引擎尚未退出，拒绝重叠启动");
+        return JNI_FALSE;
+    }
+
+    let config_str: String = match env.get_string(&config_json) {
+        Ok(s) => s.into(),
+        Err(_) => return JNI_FALSE,
+    };
+    let mut cfg: engine::EngineConfig = match serde_json::from_str(&config_str) {
+        Ok(c) => c,
+        Err(e) => {
+            emit_log(&format!("引擎配置解析失败: {e}"));
+            return JNI_FALSE;
+        }
+    };
+    emit_log("nativeStart: 配置已解析，开始接管控制 FD");
+
+    // 控制 FD → 非阻塞 tokio TcpStream（所有权移交 Rust）
+    //
+    // **必须在 tokio runtime 上下文里做 `from_std`**：tokio 的文档明确写着
+    // 「This function panics if thread-local runtime is not set」——而本函数是被 Kotlin
+    // 的 IO 线程（Dispatchers.IO）直接调进来的，不是 tokio worker，没有线程局部 runtime。
+    // 2026-10-23 20:44 的秒崩就死在这一行：日志停在「CORE: 调用 nativeStart」，之后
+    // 一条 CORE 都没有（'there is no reactor running' panic → abort）。这里显式 enter()。
+    let control_stream = {
+        if let Err(error) = std_stream.set_nonblocking(true) {
+            emit_log(&format!("控制 FD 设置非阻塞失败: {error}"));
+            return JNI_FALSE;
+        }
+        let _ = std_stream.set_nodelay(true);
+        let _enter = TOKIO_RT.enter();
+        match TcpStream::from_std(std_stream) {
+            Ok(s) => s,
+            Err(e) => {
+                emit_log(&format!("控制 FD 转换失败: {e}"));
+                return JNI_FALSE;
+            }
+        }
+    };
+    emit_log("nativeStart: 控制 FD 已注册到 tokio");
+
+    let vm = match env.get_java_vm() {
+        Ok(vm) => vm,
+        Err(_) => return JNI_FALSE,
+    };
+    let factory_obj = match env.new_global_ref(socket_provider) {
+        Ok(g) => g,
+        Err(_) => return JNI_FALSE,
+    };
+    let factory: Arc<dyn SocketProvider> = Arc::new(JniSocketProvider {
+        vm,
+        obj: factory_obj,
+    });
+
+    let (source_tx, source_rx) = mpsc::unbounded_channel::<engine::SourceEvent>();
+    let carwith_source = cfg.carlife_source;
+    let carwith_touch_source = cfg.carlife_source.then(|| source_tx.clone());
+    let (touch_tx, mut touch_rx) = mpsc::unbounded_channel::<TouchInput>();
+    let (key_tx, key_rx) = mpsc::unbounded_channel::<u32>();
+    let voice_input=voice_key::Input::new(key_tx.clone());
+    cfg.input_generation=voice_input.token;
+    // 车机 HID 触摸 → Kotlin：airplay::handle_hid_report 只负责换算坐标与边沿，
+    // 投递到这里后由独立任务回调监听器（P1 喂 Compose 首页，P2 注入 D2）。
+    // 通道随引擎重建；监听器是独立 GlobalRef，不随引擎重启丢失。
+    TOKIO_RT.spawn(callback_context::inherit(async move {
+        while let Some(t) = touch_rx.recv().await {
+            if let Some(source) = &carwith_touch_source {
+                let _ = source.send(engine::SourceEvent::CarWithTouch(t));
+            } else {
+                emit_touch(t.action, t.x, t.y);
+            }
+        }
+    }));
+    // Self-rendered media still uses source_tx/source_rx; CarWith routes only its own input above.
+    // 触摸坐标目标：手机实际编码尺寸（nativeSetVideoSize 直接更新）；
+    // 与 /info 的 encoder_size 分开，避免车机显示参数覆盖后 HID 坐标被缩放错。
+    let touch_size = Arc::new(parking_lot::Mutex::new((
+        cfg.width.max(2),
+        cfg.height.max(2),
+    )));
+    let touch_size_engine = touch_size.clone();
+    let receiver_audio_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let generation_for_engine = receiver_audio_generation.clone();
+    let shutdown = Arc::new(shutdown::EngineShutdown::new());
+
+    let stop_run = shutdown.clone();
+    let completion = shutdown::CompletionGuard(shutdown.clone());
+    let stop_result = shutdown.clone();
+    let touch_tx_engine = touch_tx.clone();
+    let key_tx_engine = key_tx.clone();
+    let engine_task = TOKIO_RT.spawn(callback_context::inherit(async move {
+        let _completion = completion;
+        let result = engine::run_engine(
+            cfg,
+            control_stream,
+            factory,
+            touch_tx_engine,
+            key_tx_engine,
+            key_rx,
+            source_rx,
+            stop_run,
+            touch_size_engine,
+            generation_for_engine,
+        )
+        .await;
+        if let Err(e) = &result {
+            emit_log(&format!("引擎退出: {e}"));
+            if !stop_result.requested() { emit_state("failed", e); }
+        }
+    }));
+    let abort = engine_task.abort_handle();
+    // panic 隔离看门狗：Cargo 已去掉 panic = "abort"，任务内 panic 由 tokio 捕获在
+    // JoinHandle 里。这里把它报成「会话失败」并留日志，而不是让进程无声消失。
+    TOKIO_RT.spawn(callback_context::inherit(async move {
+        if let Err(join_error) = engine_task.await {
+            if join_error.is_cancelled() { return; }
+            emit_log(&format!("引擎任务异常退出: {join_error}"));
+            emit_state("failed", "核心层内部异常（panic），请导出日志");
+        }
+    }));
+
+    // 发送端留在句柄里（触摸/按键通道 P1 起接给自绘 UI）
+    // 发送端留在句柄里，供 nativePushVideoFrame / nativePushAudioPcm 投喂数据
+    *ENGINE.lock() = Some(EngineHandle {
+        receiver_audio_generation,
+        voice_input,
+        shutdown,
+        abort,
+        source_tx,
+        carwith_source,
+        touch_size,
+    });
+
+    emit_log("nativeStart: 引擎任务已派生");
+    emit_state("starting", "核心层引擎已启动");
+    JNI_TRUE
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStop(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    let _lifecycle = ENGINE_LIFECYCLE.lock();
+    stop_engine(false);
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStopGracefully(
+    _env: JNIEnv, _class: JClass,
+) -> jboolean { let _lifecycle = ENGINE_LIFECYCLE.lock(); if stop_engine(true) { JNI_TRUE } else { JNI_FALSE } }
+
+fn stop_engine(graceful: bool) -> bool {
+    shutdown::stop_retaining(&ENGINE, |handle| {
+        handle.shutdown.request(graceful);
+        // Auxiliary audio can take 4 s, followed by media task cleanup and bounded RTSP releases.
+        let budget_ms = if graceful { 7_000 } else { 2_000 };
+        let done = handle.shutdown.wait_done(std::time::Duration::from_millis(budget_ms));
+        if !done {
+            emit_log("SESSION-CLOSE: 旧引擎停止超时，强制取消");
+            handle.abort.abort();
+        }
+        let done = done || handle.shutdown.wait_done(std::time::Duration::from_millis(300));
+        emit_log(&format!("SESSION-CLOSE: 引擎清理 completed={done} retained={} graceful={graceful}", !done));
+        done
+    })
+}
+
+/// 投喂一帧 H.264（Annex B，来自本机 MediaCodec 的编码输出）。
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushVideoFrame(
+    env: JNIEnv,
+    _class: JClass,
+    data: JByteArray,
+    pts_us: jlong,
+) {
+    let Ok(len) = env.get_array_length(&data) else {
+        return;
+    };
+    if len <= 0 {
+        return;
+    }
+    let mut buf = vec![0i8; len as usize];
+    if env.get_byte_array_region(&data, 0, &mut buf).is_err() {
+        return;
+    }
+    let bytes: Vec<u8> = buf.into_iter().map(|b| b as u8).collect();
+    if let Some(handle) = ENGINE.lock().as_ref() {
+        let _ = handle.source_tx.send(engine::SourceEvent::VideoFrame {
+            pts_us: pts_us.max(0) as u64,
+            data: bytes,
+        });
+    }
+}
+
+/// Codec-tagged Annex B: 0=H.264, 1=HEVC. Unknown tags are rejected.
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushVideoFrameWithCodec(
+    env:JNIEnv, _class:JClass, data:JByteArray, pts_us:jlong, codec:jint,
+) {
+    let Some(codec)=video_format::VideoCodec::from_id(codec) else {return;};
+    let Ok(bytes)=env.convert_byte_array(&data) else {return;};
+    if bytes.is_empty() {return;}
+    if let Some(handle)=ENGINE.lock().as_ref() {
+        let _=handle.source_tx.send(engine::SourceEvent::VideoFrameTagged {pts_us:pts_us.max(0) as u64,data:bytes,codec,origin:video_format::FrameOrigin::Live});
+    }
+}
+
+/// 投喂编码画面的新尺寸（对齐 AirPlay VideoConfig）。
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSetVideoSize(
+    _env: JNIEnv,
+    _class: JClass,
+    width: jint,
+    height: jint,
+) {
+    if let Some(handle) = ENGINE.lock().as_ref() {
+        *handle.touch_size.lock() = (width.max(2) as u32, height.max(2) as u32);
+        let _ = handle.source_tx.send(engine::SourceEvent::EncoderResolution {
+            width: width.max(2) as u32,
+            height: height.max(2) as u32,
+        });
+    }
+}
+
+/// 投喂一包 PCM（16-bit 小端交错；用于把手机音频送进 AirPlay 音频流）。
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushAudioPcm(
+    env: JNIEnv,
+    _class: JClass,
+    pcm: JShortArray,
+    rate: jint,
+    channels: jint,
+) {
+    let Ok(len) = env.get_array_length(&pcm) else {
+        return;
+    };
+    if len <= 0 {
+        return;
+    }
+    let mut buf = vec![0i16; len as usize];
+    if env.get_short_array_region(&pcm, 0, &mut buf).is_err() {
+        return;
+    }
+    let bytes: Vec<u8> = buf.iter().flat_map(|s| s.to_le_bytes()).collect();
+    if let Some(handle) = ENGINE.lock().as_ref() {
+        let _ = handle.source_tx.send(engine::SourceEvent::AudioData {
+            tts: false,
+            rate: rate.max(8000) as u32,
+            channels: channels.clamp(1, 2) as u8,
+            received_at: std::time::Instant::now(),
+            data: bytes,
+        });
+    }
+}
+
+fn navigation_audio_format(rate:jint,channels:jint,samples:Option<usize>)->Option<(u32,u8)> {
+    if !(4000..=96000).contains(&rate) || !(1..=2).contains(&channels) {return None;}
+    if samples.is_some_and(|count|count==0 || count%channels as usize!=0) {return None;}
+    Some((rate as u32,channels as u8))
+}
+fn navigation_audio_event(rate:jint,channels:jint,pcm:Option<&[i16]>)->Option<engine::SourceEvent> {
+    let (rate,channels)=navigation_audio_format(rate,channels,pcm.map(<[i16]>::len))?;
+    Some(match pcm {
+        None=>engine::SourceEvent::AudioInit{tts:true,rate,channels},
+        Some(pcm)=>engine::SourceEvent::AudioData{received_at:std::time::Instant::now(),tts:true,rate,channels,data:pcm.iter().flat_map(|s|s.to_le_bytes()).collect()},
+    })
+}
+fn send_navigation_audio(event:engine::SourceEvent) {
+    if let Some(handle)=ENGINE.lock().as_ref().filter(|h|!h.shutdown.requested()) {let _=handle.source_tx.send(event);}
+}
+/// UID-isolated self-rendered navigation; media capture keeps its existing lane.
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStartNavigationAudio(
+    _env:JNIEnv,_class:JClass,rate:jint,channels:jint,
+) {
+    if let Some(event)=navigation_audio_event(rate,channels,None) {send_navigation_audio(event);}
+}
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativePushNavigationAudioPcm(
+    env:JNIEnv,_class:JClass,pcm:JShortArray,rate:jint,channels:jint,
+) {
+    let Ok(len)=env.get_array_length(&pcm) else {return;};
+    if navigation_audio_format(rate,channels,Some(len as usize)).is_none() {return;}
+    let mut samples=vec![0i16;len as usize];
+    if env.get_short_array_region(&pcm,0,&mut samples).is_err() {return;}
+    if let Some(event)=navigation_audio_event(rate,channels,Some(&samples)) {send_navigation_audio(event);}
+}
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeStopNavigationAudio(
+    _env:JNIEnv,_class:JClass,
+) {send_navigation_audio(engine::SourceEvent::AudioStop{tts:true});}
+
+#[cfg(test)]
+mod navigation_audio_jni_tests {
+    use super::*;
+    #[test] fn navigation_pcm_rejects_invalid_format_and_incomplete_interleaved_frames() {
+        for rate in [4000,16000,48000,96000] {
+            for channels in [1,2] {assert_eq!(navigation_audio_format(rate,channels,Some(8)),Some((rate as u32,channels as u8)));}
+        }
+        for (rate,channels,samples) in [(3999,1,8),(96001,1,8),(48000,0,8),(48000,3,8),(48000,2,3),(48000,1,0)] {
+            assert_eq!(navigation_audio_format(rate,channels,Some(samples)),None);
+        }
+        assert_eq!(navigation_audio_format(48000,2,None),Some((48000,2)));
+    }
+    #[test] fn navigation_events_preserve_pcm_and_use_only_the_tts_lane() {
+        assert!(matches!(navigation_audio_event(48000,2,None),Some(engine::SourceEvent::AudioInit{tts:true,rate:48000,channels:2})));
+        assert!(matches!(navigation_audio_event(16000,1,Some(&[1,-2])),Some(engine::SourceEvent::AudioData{tts:true,rate:16000,channels:1,data,..}) if data==[1,0,254,255]));
+        assert!(navigation_audio_event(48000,2,Some(&[1])).is_none());
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeIsRunning(
+    _env: JNIEnv,
+    _class: JClass,
+) -> jboolean {
+    if ENGINE.lock().is_some() {
+        JNI_TRUE
+    } else {
+        JNI_FALSE
+    }
+}
+
+/// Request audio for a fresh playback action; this does not directly enable RTP.
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeRequestAudioOwnership(
+    _env: JNIEnv, _class: JClass,
+) -> jboolean {
+    if ENGINE.lock().as_ref().is_some_and(|h| {
+        let intent = audio_resource::PlaybackIntent::play(&h.receiver_audio_generation);
+        !h.shutdown.requested() && h.source_tx.send(engine::SourceEvent::RequestAudioOwnership(intent, std::time::Instant::now())).is_ok()
+    }) {
+        JNI_TRUE
+    } else { JNI_FALSE }
+}
+
+/// Queue a choice from the receiver's last active view-area declaration.
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeRequestViewArea(
+    mut env: JNIEnv, _class: JClass, revision: jlong, display: JString, target: jint,
+) -> jboolean {
+    let Ok(uuid) = env.get_string(&display) else { return JNI_FALSE; };
+    let request = display_layout::ViewRequest { revision, uuid: uuid.into(), target };
+    if ENGINE.lock().as_ref().is_some_and(|h| !h.shutdown.requested()
+        && h.source_tx.send(engine::SourceEvent::RequestViewArea(request)).is_ok()) { JNI_TRUE } else { JNI_FALSE }
+}
+
+/// Ask the accessory to show its own UI; never stop the session or the audio pump.
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeRequestHostUi(
+    _env: JNIEnv, _class: JClass,
+) -> jboolean {
+    if ENGINE.lock().as_ref().map(|h| h.source_tx.send(engine::SourceEvent::RequestHostUi).is_ok()).unwrap_or(false) {
+        JNI_TRUE
+    } else { JNI_FALSE }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeVoiceKeyToken(
+    _env: JNIEnv, _class: JClass,
+) -> jlong {
+    ENGINE.lock().as_ref().filter(|h| !h.shutdown.requested())
+        .map_or(0, |h| h.voice_input.token as jlong)
+}
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeSendVoiceKey(
+    _env: JNIEnv, _class: JClass, token: jlong, action: jint,
+) -> jboolean {
+    if ENGINE.lock().as_ref().is_some_and(|h| !h.shutdown.requested() && h.voice_input.send(token as u64, action)) {
+        JNI_TRUE
+    } else { JNI_FALSE }
+}
+
+/// Authenticated, decoded self-rendered microphone PCM; never written to logs or disk.
+pub(crate) fn emit_microphone_pcm(owner:u64, token:u64, pcm:&[u8], rate:u32, end:bool) {
+    call_listener("onMicrophonePcm", |env,obj| {
+        let data=env.byte_array_from_slice(pcm)?;
+        env.call_method(obj,"onMicrophonePcm","(JJ[BIZ)V",&[
+            (owner as jlong).into(),(token as jlong).into(),(&data).into(),(rate as jint).into(),
+            (if end {JNI_TRUE}else{JNI_FALSE}).into(),
+        ]).map(|_|())
+    });
+}
+
+#[no_mangle]
+pub extern "system" fn Java_io_github_hypercar_core_RustCoreBridge_nativeCancelMicrophone(
+    _env:JNIEnv,_class:JClass,token:jlong,
+)->jboolean {
+    if token>0 && ENGINE.lock().as_ref().is_some_and(|h|
+        !h.shutdown.requested() && h.source_tx.send(engine::SourceEvent::CancelSelfAsr(token as u64)).is_ok()) {
+        JNI_TRUE
+    } else {JNI_FALSE}
+}

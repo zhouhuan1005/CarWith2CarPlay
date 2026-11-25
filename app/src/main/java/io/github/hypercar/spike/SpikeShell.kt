@@ -1,0 +1,205 @@
+package io.github.hypercar.spike
+
+import android.content.ComponentName
+import android.content.Context
+import android.content.ServiceConnection
+import android.os.Binder
+import android.os.IBinder
+import android.view.Surface
+import android.view.MotionEvent
+import io.github.hypercar.BuildConfig
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import rikka.shizuku.Shizuku
+
+/**
+ * SPIKE-P0：绑定 Shizuku UserService（shell 进程），在那里建 D2。
+ *
+ * 调用方必须在 IO 线程：bind 本身要切主线程（Shizuku 回调走主线程），
+ * 建屏/释放是 binder 事务，别放主线程。
+ */
+object SpikeShell {
+
+    @Volatile
+    private var service: ISpikeShell? = null
+
+    @Volatile private var connection: ServiceConnection? = null
+    private var args: Shizuku.UserServiceArgs? = null
+    private val bindMutex = Mutex()
+    private val displayOwner = Binder()
+    @Volatile var isBinding: Boolean = false
+        private set
+
+    internal val userServiceBinder: IBinder? get() = service?.asBinder()?.takeIf { it.isBinderAlive }
+
+    fun isConnected(): Boolean = userServiceBinder != null
+
+    fun startAudioCapture(owner: IBinder): android.os.ParcelFileDescriptor? = service?.startAudioCapture(owner)
+    fun startSplitAudioCapture(owner: IBinder, navigationUid: Int): Array<android.os.ParcelFileDescriptor>? =
+        service?.startSplitAudioCapture(owner, navigationUid)
+    fun stopAudioCapture() { service?.stopAudioCapture() }
+    fun audioCaptureStatus(): String = service?.audioCaptureStatus() ?: "shell disconnected"
+    fun startBluetoothDiscoverable(owner: IBinder, token: String, seconds: Int): String =
+        call("startBluetoothDiscoverable") { it.startBluetoothDiscoverable(owner, token, seconds) }
+    fun stopBluetoothDiscoverable(token: String): String =
+        call("stopBluetoothDiscoverable") { it.stopBluetoothDiscoverable(token) }
+    fun startWifiSelection(owner: IBinder, token: String, ssid: String, bssid: String, uid: Int): String =
+        call("startWifiSelection") { it.startWifiSelection(owner, token, ssid, bssid, uid) }
+    fun stopWifiSelection(token: String): String =
+        call("stopWifiSelection") { it.stopWifiSelection(token) }
+
+    fun updateDisplaySurface(id: Int, surface: Surface?, width: Int, height: Int, dpi: Int): String =
+        service?.updateDisplaySurface(id, surface, width, height, dpi) ?: "ERR shell disconnected"
+
+    fun touchEvent(displayId: Int, event: MotionEvent): String =
+        call("touchEvent") { it.touchEvent(displayId, event) }
+
+    fun prepareProjection(retainedMapName: String): String =
+        call("prepareProjection") { it.prepareProjection(retainedMapName) }
+
+    internal fun captureInstrumentMap(id: Int, w: Int, h: Int, maxW: Int, maxH: Int): android.graphics.Bitmap? {
+        val shell = service ?: return null
+        if (maxW !in 1..960 || maxH !in 1..540) return null
+        return runCatching {
+            android.os.SharedMemory.create("hypercar-instrument-map", maxW * maxH * 4).use { memory ->
+                val size = shell.captureInstrumentMap(displayOwner, id, w, h, maxW, maxH, memory) ?: return null
+                if (size.size != 2 || size[0] !in 1..maxW || size[1] !in 1..maxH) return null
+                val buffer = memory.mapReadOnly()
+                try {
+                    val bitmap = android.graphics.Bitmap.createBitmap(size[0], size[1], android.graphics.Bitmap.Config.ARGB_8888)
+                    try { bitmap.apply { copyPixelsFromBuffer(buffer) } }
+                    catch (error: Throwable) { bitmap.recycle(); throw error }
+                } finally { android.os.SharedMemory.unmap(buffer) }
+            }
+        }.getOrNull()
+    }
+
+    /** 绑定（幂等）。返回人话结果，写进 spike 报告。 */
+    suspend fun connect(context: Context): String {
+        return bindMutex.withLock {
+            if (isConnected()) return@withLock "已连接"
+            service = null
+            isBinding = true
+            try { connectUnlocked(context) } finally { isBinding = false }
+        }
+    }
+
+    private suspend fun connectUnlocked(context: Context): String {
+        if (!Shizuku.pingBinder()) return "Shizuku 未运行"
+        val deferred = CompletableDeferred<String>()
+        val conn = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+                if (connection !== this) return
+                if (binder == null) {
+                    deferred.complete("onServiceConnected binder=null")
+                    return
+                }
+                service = ISpikeShell.Stub.asInterface(binder)
+                deferred.complete("connected")
+            }
+
+            override fun onServiceDisconnected(name: ComponentName?) {
+                if (connection !== this) return
+                service = null
+                SpikeReport.add("SHELL", "user service 断开")
+            }
+        }
+        connection = conn
+        val a = Shizuku.UserServiceArgs(
+            ComponentName(context.packageName, SpikeShellService::class.java.name),
+        )
+            .daemon(false)
+            .processNameSuffix("spike")
+            .debuggable(BuildConfig.DEBUG)
+            // AIDL revision also distinguishes local installs sharing the same versionCode.
+            .version(BuildConfig.VERSION_CODE + 4)
+        args = a
+        // 注意：**不要**在 Main 线程调 bindUserService。Shizuku 13.6 在某些机型上会同步等待
+        // 用户服务把 binder 交回来；放主线程会与「回调也要主线程」互相等死（真机踩过：
+        // 主线程卡住、日志停在 bind 前，行为像 ANR 但没有 ANR 记录）。
+        SpikeReport.add("SHELL", "调用 bindUserService → ${context.packageName}:spike")
+        val called = try {
+            Shizuku.bindUserService(a, conn)
+            SpikeReport.add("SHELL", "bindUserService 已返回")
+            true
+        } catch (t: Throwable) {
+            SpikeReport.add(
+                "SHELL",
+                "bindUserService 异常: ${t.javaClass.simpleName}: ${t.message}",
+            )
+            false
+        }
+        if (!called) return "bindUserService 调用失败"
+        val result = withTimeoutOrNull(12_000) { deferred.await() } ?: "绑定超时（12s）"
+        SpikeReport.add("SHELL", "bind 结果: $result")
+        return result
+    }
+
+    fun createDisplay(
+        surface: Surface,
+        width: Int,
+        height: Int,
+        dpi: Int,
+        flags: Int = 0,
+        name: String = "hypercar-d2",
+    ): String = runCatching {
+        service?.createDisplay(displayOwner, surface, width, height, dpi, flags, name) ?: "ERR 未连接"
+    }.getOrElse { "ERR ${it.javaClass.simpleName}: ${it.message}" }
+
+    fun releaseDisplay(): String = runCatching {
+        service?.releaseDisplay() ?: "ERR 未连接"
+    }.getOrElse { "ERR ${it.javaClass.simpleName}: ${it.message}" }
+
+    /** P2：只释放指定副屏（D1/D2 并存）。 */
+    fun releaseDisplay(displayId: Int): String = runCatching {
+        service?.releaseDisplayById(displayId) ?: "ERR 未连接"
+    }.getOrElse { "ERR ${it.javaClass.simpleName}: ${it.message}" }
+
+    fun status(): String = runCatching {
+        service?.status() ?: "ERR 未连接"
+    }.getOrElse { "ERR ${it.javaClass.simpleName}: ${it.message}" }
+
+    /** 真息屏：物理面板断电（系统保持唤醒），false=断电，true=点亮。 */
+    fun setPhysicalScreenPower(on: Boolean): Boolean = runCatching {
+        service?.setPhysicalScreenPower(on) ?: false
+    }.getOrDefault(false)
+
+    fun motion(displayId: Int, action: Int, x: Int, y: Int, downTimeMs: Long): String =
+        call("motion") { it.motion(displayId, action, x, y, downTimeMs) }
+
+    fun tap(displayId: Int, x: Int, y: Int): String =
+        call("tap") { it.tap(displayId, x, y) }
+
+    fun swipe(displayId: Int, x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Int): String =
+        call("swipe") { it.swipe(displayId, x1, y1, x2, y2, durationMs) }
+
+    fun pinch(displayId: Int, cx: Int, cy: Int, from: Int, to: Int, steps: Int): String =
+        call("pinch") { it.pinch(displayId, cx, cy, from, to, steps) }
+
+    fun inputState(): String = call("inputState") { it.inputState() }
+
+    fun readDisplayImePolicy(displayId: Int): String = call("readDisplayImePolicy") { it.readDisplayImePolicy(displayId) }
+
+    fun consoleKey(displayId: Int, keyCode: Int, metaState: Int): String =
+        call("consoleKey") { it.consoleKey(displayId, keyCode, metaState) }
+
+    private inline fun call(name: String, block: (ISpikeShell) -> String): String =
+        runCatching { service?.let(block) ?: "ERR 未连接" }.getOrElse {
+            "ERR $name ${it.javaClass.simpleName}: ${it.message}"
+        }
+
+    fun disconnect() {
+        val a = args
+        val c = connection
+        if (a != null && c != null) {
+            runCatching { Shizuku.unbindUserService(a, c, false) }
+        }
+        service = null
+        connection = null
+        args = null
+    }
+}

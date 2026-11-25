@@ -1,0 +1,47 @@
+package io.github.hypercar.session
+
+import java.io.File
+import java.util.Locale
+
+/** 本机证据，不等价于车机当前仍授权；全局手机身份不能代表已与某台车配对。 */
+data class PairingEvidence(val identityPresent: Boolean, val receiverCredentialPresent: Boolean) {
+    val mayDropProfiles: Boolean get() = identityPresent && receiverCredentialPresent
+
+    companion object {
+        /** A shared/home SSID is a discovery hint, never a desktop receiver's credential identity. */
+        fun receiverMac(activePeer: String?, sessionPeer: String?, wifiHint: String?, desktop: Boolean): String? =
+            activePeer?.takeIf { receiverKey(it) != null }
+                ?: sessionPeer?.takeIf { receiverKey(it) != null }
+                ?: wifiHint?.takeIf { !desktop && receiverKey(it) != null }
+
+
+        /** Same preference key before RFCOMM starts and after the AirPlay peer is known. */
+        fun canvasKey(profile: String, vararg candidates: String?): String? =
+            candidates.firstNotNullOfOrNull(::receiverKey)?.let { "$profile:$it" }
+
+        /** The same BMW display may have been observed using the other MGU/IDC23 profile. */
+        fun cachedCanvas(key: String?, read: (String) -> Pair<Int, Int>?): Pair<Int, Int>? {
+            if (key == null) return null
+            read(key)?.let { return it }
+            val other = when (key.substringBefore(':')) {
+                "bmw_id9" -> "bmw_id85"
+                "bmw_id85" -> "bmw_id9"
+                else -> return null
+            }
+            return read("$other:${key.substringAfter(':')}")
+        }
+
+        fun receiverKey(mac: String?): String? {
+            val normalized = mac?.trim()?.lowercase(Locale.ROOT) ?: return null
+            if (!Regex("(?:[0-9a-f]{2}:){5}[0-9a-f]{2}").matches(normalized)) return null
+            return "bt_" + normalized.replace(":", "")
+        }
+
+        fun read(filesDir: File, mac: String?): PairingEvidence {
+            val identity = PairingIdentityFiles.location(filesDir, mac).file
+            val key = receiverKey(mac)
+            return PairingEvidence(identity.isFile && identity.length() > 0,
+                key != null && File(identity.parentFile, "${identity.name}.paired-$key").isFile)
+        }
+    }
+}

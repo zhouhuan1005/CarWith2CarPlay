@@ -1,0 +1,177 @@
+package io.github.hypercar.headunit
+
+import java.io.File
+import org.json.JSONObject
+import org.junit.Assert.*
+import org.junit.Test
+
+class RemoteProfilesTest {
+    @Test fun mguUsesResourceLifecycleWithoutChangingBootstrapOrActivationPolicy() {
+        val mgu = HeadUnitProfiles.BMW_ID85
+        assertTrue(mgu.screenResourceLifecycleEnabled(false))
+        assertFalse(mgu.nbtAudioFirst)
+        assertFalse(mgu.id9ScreenBootstrap)
+        assertFalse(mgu.mbuxScreenBootstrap)
+        assertTrue(mgu.requireAirplayActivation)
+        assertTrue(mgu.openEaSessions)
+        assertTrue(mgu.sendTransportIdentifier)
+        assertFalse(mgu.allowOutboundIap2)
+        assertTrue(ReceiverCompatibility.useBmwBootstrap(mgu.id, "BMW MGU"))
+    }
+
+    @Test fun schemaTwelveProtectsMguLifecycleWhilePreservingOtherReceiverOverrides() {
+        val mgu = HeadUnitProfiles.BMW_ID85
+        val stale = mgu.copy(useScreenResourceLifecycle = false)
+        for (schema in 8..11) {
+            val merged = RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(stale), schema)
+            assertTrue("schema=$schema", merged.single { it.id == mgu.id }.useScreenResourceLifecycle)
+            assertFalse(RemoteProfiles.canOverrideBuiltin(mgu.id, schema))
+        }
+        assertEquals(12, RemoteProfiles.SCHEMA)
+        assertTrue(RemoteProfiles.canOverrideBuiltin(mgu.id, 12))
+        assertEquals(stale, RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(stale), 12)
+            .single { it.id == mgu.id })
+        for ((profile, schema) in listOf(HeadUnitProfiles.BMW_ID6 to 11,
+            HeadUnitProfiles.BMW_ID9 to 9, HeadUnitProfiles.MERCEDES_MBUX to 10,
+            HeadUnitProfiles.VOLKSWAGEN to 8)) {
+            val override = profile.copy(preferMdnsAirplay = !profile.preferMdnsAirplay)
+            assertEquals(override, RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(override), schema)
+                .single { it.id == profile.id })
+        }
+    }
+
+    @Test fun schemaSevenCannotRestoreVolkswagenUnverifiedLabelOrChangeItsHandshake() {
+        val old = RemoteProfiles.parse("""{"_schema":7,"profiles":[{
+            "id":"volkswagen_mib","verified":false,"notes":"未实车验证"}]}""")
+        val effective = RemoteProfiles.merge(HeadUnitProfiles.builtin, old, 7)
+            .single { it.id == "volkswagen_mib" }
+        assertEquals(HeadUnitProfiles.VOLKSWAGEN, effective)
+        assertTrue(effective.verified)
+        assertFalse(HeadUnitProfiles.MERCEDES_MBUX.verified)
+    }
+
+    @Test fun cachedSchemaSixCannotDisableAudiHandshakeMessages() {
+        val old = RemoteProfiles.parse("""{"_schema":6,"profiles":[{
+            "id":"audi_mib3","sendCarPlayAvailability":false,
+            "openEaSessions":false,"sendTransportIdentifier":false}]}""")
+        val effective = RemoteProfiles.merge(HeadUnitProfiles.builtin, old, 6)
+            .single { it.id == "audi_mib3" }
+        assertEquals(HeadUnitProfiles.AUDI_MIB3, effective)
+        assertTrue(effective.sendCarPlayAvailability)
+        assertTrue(effective.openEaSessions)
+        assertTrue(effective.sendTransportIdentifier)
+        // Credential-only MMI must still discover the endpoint without a ctrl invite.
+        assertFalse(effective.requireAirplayActivation)
+        assertFalse(effective.requireFreshCtrlInvite)
+    }
+
+    @Test fun volkswagenFieldsInheritAndRoundTripWithoutOldCacheOverridingTheGate() {
+        val vw = HeadUnitProfiles.VOLKSWAGEN
+        val inherited = RemoteProfiles.parse("""{"profiles":[{"id":"volkswagen_mib"}]}""").single()
+        assertEquals(vw, inherited)
+        val stale = vw.copy(requireFreshCtrlInvite = false)
+        val merged = RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(stale), 5)
+        assertEquals(vw, merged.single { it.id == vw.id })
+        assertEquals(listOf(vw), RemoteProfiles.parse(RemoteProfiles.encode(listOf(vw))))
+
+    }
+
+    @Test fun omittedFieldsInheritEachBuiltinIncludingActivationAndHints() {
+        for (builtin in HeadUnitProfiles.builtin) {
+            val parsed = RemoteProfiles.parse("""[{"id":"${builtin.id}"}]""").single()
+            assertEquals(builtin.id, builtin, parsed)
+        }
+    }
+
+    @Test fun explicitOverridesCanDisableActivationAndClearOptionalValues() {
+        val parsed = RemoteProfiles.parse("""[{"id":"bmw_id85",
+            "requireAirplayActivation":false,"dropProfilesBeforeIap2":false,
+            "pairingHint":"","touchDisplay":""}]""").single()
+        assertFalse(parsed.requireAirplayActivation)
+        assertFalse(parsed.dropProfilesBeforeIap2)
+        assertNull(parsed.pairingHint)
+        assertNull(parsed.touchDisplay)
+    }
+
+    @Test fun newProfileUsesBmwTemplateForOmittedPolicies() {
+        val parsed = RemoteProfiles.parse("""[{"id":"new_car","label":"New car"}]""").single()
+        assertEquals(HeadUnitProfiles.BMW_ID85.copy(id = "new_car", label = "New car"), parsed)
+    }
+
+    @Test fun id9BootstrapIsInheritedAndCannotBeDisabledBySchemaEightCache() {
+        val id9 = HeadUnitProfiles.BMW_ID9
+        assertEquals(id9, RemoteProfiles.parse("""[{"id":"bmw_id9"}]""").single())
+        val old = id9.copy(id9ScreenBootstrap = false)
+        assertTrue(RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(old), 8).single { it.id == id9.id }.id9ScreenBootstrap)
+        assertEquals(id9, RemoteProfiles.parse(RemoteProfiles.encode(listOf(id9))).single())
+    }
+
+    @Test fun id9SchemaUpgradeDoesNotInvalidateExistingReceiversSchemaEightOverrides() {
+        val overrides = listOf(HeadUnitProfiles.AUDI_MIB3, HeadUnitProfiles.VOLKSWAGEN, HeadUnitProfiles.WINPLAY,
+            HeadUnitProfiles.GENERIC).map { it.copy(preferMdnsAirplay = !it.preferMdnsAirplay) }
+        val oldId9 = HeadUnitProfiles.BMW_ID9.copy(id9ScreenBootstrap = false)
+        val effective = RemoteProfiles.merge(HeadUnitProfiles.builtin, overrides + oldId9, 8)
+        overrides.forEach { expected ->
+            assertEquals(expected.id, expected, effective.single { it.id == expected.id })
+            assertTrue(RemoteProfiles.canOverrideBuiltin(expected.id, 8))
+            assertFalse(RemoteProfiles.canOverrideBuiltin(expected.id, 7))
+        }
+        assertEquals(HeadUnitProfiles.BMW_ID9, effective.single { it.id == oldId9.id })
+        assertFalse(RemoteProfiles.canOverrideBuiltin(oldId9.id, 8))
+        assertTrue(RemoteProfiles.canOverrideBuiltin(oldId9.id, 9))
+    }
+
+    @Test fun oldCacheCannotOverrideBuiltinsButCanAddProfiles() {
+        val stale = HeadUnitProfiles.BMW_ID85.copy(
+            requireAirplayActivation = false, dropProfilesBeforeIap2 = false,
+        )
+        val extra = stale.copy(id = "extra")
+        val merged = RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(stale, extra), 3)
+        assertEquals(HeadUnitProfiles.BMW_ID85, merged.first { it.id == stale.id })
+        assertEquals(extra, merged.last())
+    }
+
+    @Test fun currentSchemaAcceptsIntentionalOverrides() {
+        val override = HeadUnitProfiles.BMW_ID85.copy(requireAirplayActivation = false)
+        val merged = RemoteProfiles.merge(HeadUnitProfiles.builtin, listOf(override), RemoteProfiles.SCHEMA)
+        assertEquals(override, merged.first())
+    }
+
+    @Test fun exportPreservesAllPoliciesAndCanBeMergedAgain() {
+        val profiles = HeadUnitProfiles.builtin + HeadUnitProfiles.WINPLAY.copy(
+            id = "custom", requireAirplayActivation = true,
+            touchDisplay = null, pairingHint = null,
+        )
+        val raw = RemoteProfiles.encode(profiles)
+        val schema = JSONObject(raw).getInt("_schema")
+        assertEquals(RemoteProfiles.SCHEMA, schema)
+        val parsed = RemoteProfiles.parse(raw)
+        assertEquals(profiles, parsed)
+        assertEquals(profiles, RemoteProfiles.merge(HeadUnitProfiles.builtin, parsed, schema))
+    }
+
+    @Test fun publishedConfigMatchesBuiltinConnectionPolicies() {
+        val config = listOf(File("../profiles/headunits.json"), File("profiles/headunits.json"))
+            .first { it.isFile }.readText()
+        assertEquals(RemoteProfiles.SCHEMA, JSONObject(config).getInt("_schema"))
+        val remote = RemoteProfiles.parse(config).associateBy { it.id }
+        assertEquals(HeadUnitProfiles.builtin.map { it.id }.toSet(), remote.keys)
+        for (builtin in HeadUnitProfiles.builtin) {
+            // Display copy may differ, transport and lifecycle policies must not drift.
+            val actual = remote.getValue(builtin.id)
+            assertEquals(builtin.id, builtin.copy(
+                label = actual.label, model = actual.model, notes = actual.notes,
+                pairingHint = actual.pairingHint,
+            ), actual)
+        }
+    }
+    @Test fun cachedSchemaFourCannotReenableBmwAudioProfileDrops() {
+        val stale = RemoteProfiles.parse("""{"_schema":4,"profiles":[
+            {"id":"bmw_id85","dropProfilesBeforeIap2":true}]}""")
+        val effective = RemoteProfiles.merge(HeadUnitProfiles.builtin, stale, 4)
+            .single { it.id == "bmw_id85" }
+        assertFalse(effective.dropProfilesBeforeIap2)
+        assertFalse(effective.allowOutboundIap2)
+        assertTrue(effective.requireAirplayActivation)
+    }
+}

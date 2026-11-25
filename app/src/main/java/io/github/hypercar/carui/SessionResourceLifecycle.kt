@@ -1,0 +1,45 @@
+package io.github.hypercar.carui
+
+import java.util.concurrent.atomic.AtomicLong
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+
+/** Serializes creation/destruction while invalidating queued work immediately on stop. */
+internal class SessionResourceLifecycle {
+    private val generation = AtomicLong()
+    private val changes = Mutex()
+    private var owner = -1L
+
+    fun ticket(): Long = generation.get()
+    fun retire(): Long = generation.incrementAndGet()
+    fun isCurrent(ticket: Long) = ticket == generation.get()
+
+    suspend fun <T> start(ticket: Long, current: () -> Boolean, cleanup: suspend () -> Unit, create: suspend () -> T): T? =
+        changes.withLock {
+            if (!isCurrent(ticket) || !current()) return@withLock null
+            if (owner != ticket) cleanup()
+            owner = ticket
+            try {
+                val result = create()
+                if (isCurrent(ticket) && current()) result else {
+                    cleanup(); owner = -1L; null
+                }
+            } catch (error: Throwable) {
+                withContext(NonCancellable) { cleanup() }; owner = -1L
+                throw error
+            }
+        }
+
+    suspend fun <T> restart(ticket: Long, current: () -> Boolean, cleanup: suspend () -> Unit,
+        create: suspend () -> T): T? = start(ticket, current, cleanup) {
+        cleanup()
+        if (isCurrent(ticket) && current()) create() else null
+    }
+
+    suspend fun stop(retired: Long, cleanup: suspend () -> Unit) = changes.withLock {
+        // A newer start can acquire the mutex before a queued stop. Never tear it down.
+        if (owner < retired) { cleanup(); owner = -1L }
+    }
+}

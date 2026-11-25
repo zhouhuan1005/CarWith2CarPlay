@@ -1,0 +1,164 @@
+package io.github.hypercar.core
+
+/**
+ * Rust 核心层 JNI 桥（libhypercar_core.so）。
+ *
+ * 与「参考文档」的分工差异（详见 docs/NEGOTIATION-GAPS.md）：
+ *  - 参考文档：Kotlin 完成 AirPlay 全部协商后把「已连通的 FD + 密钥」交给 Rust；
+ *  - 本项目：协商整体下沉 Rust（/info、pair-verify、RTSP SETUP、事件通道、三条心跳），
+ *    Kotlin 只负责「拿到绑定车机网络的 socket FD」并通过 [SocketProvider] 按需供给。
+ *    这样协商状态机只有一份实现，秒连路径少一次跨语言往返。
+ */
+object RustCoreBridge {
+
+    init {
+        System.loadLibrary("hypercar_core")
+        nativeInitLogger()
+    }
+
+    /**
+     * socket 供给器：Rust 协商过程中需要新开「绑定车机网络」的套接字
+     * （事件通道、视频 dataPort、音频 dataPort/controlPort、keepAlive 端口）。
+     * Kotlin 实现必须走 carNetwork.socketFactory / carNetwork.bindSocket，
+     * 保证不走手机流量；返回 Linux FD（已 detach），失败返回 -1。
+     */
+    interface SocketProvider {
+        fun openTcpFd(host: String, port: Int, timeoutMs: Int): Int
+        /** port=0 binds an ephemeral, network-scoped receive socket without connecting a peer. */
+        fun openUdpFd(host: String, port: Int): Int
+        /** Bind the native timing socket to this session's network. Rust retains ownership. */
+        fun bindTimingFd(fd: Int): Boolean
+    }
+
+    /** Rust → Kotlin 状态/日志回调（在 Rust 工作线程调用，实现方需自行切主线程）。 */
+    interface EventListener {
+        /** 状态迁移：[state] 为机器码，[detail] 为人话（见 engine.rs 的 emit 调用）。 */
+        fun onState(state: String, detail: String)
+
+        fun onLog(line: String)
+        fun onCarWithReopen(attempt: Long, startup: Boolean) {}
+        fun onPipeline(json: String) {}
+        fun onEventChannel(rtsp: Long, uptime: Long, cause: String, videoTcp: String) {}
+        fun onCarWithNavigation(token: Long, json: String) {
+            io.github.hypercar.navigation.CarWithNavigation.receive(token, json)
+        }
+
+        /** 统计心跳（约 1s 一次）：fps/frames/kbps/音频闪避。 */
+        fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean)
+
+        /** 车机日夜模式（AirPlay setNightMode）：true = 夜间。 */
+        fun onNightMode(night: Boolean)
+        fun onReceiverUi(kind: String, payload: String) {}
+        /** Consumer media usage, or a CarConsoleKey event when the projected source is the local UI. */
+        fun onMediaKey(usage: Int) {}
+        fun onReceiverAudioTake(taken: Boolean) {}
+        /** Voice button routed to the phone assistant only for the self-rendered source. */
+        fun onVoiceAssistant() {}
+        /** Authenticated type107 PCM16 mono, scoped to one capture; empty/end closes its pipe. */
+        fun onMicrophonePcm(owner: Long, token: Long, pcm: ByteArray, rate: Int, end: Boolean) {}
+
+        /** 车机 forceKeyFrame：请求编码器立刻产出 IDR。 */
+        fun onForceKeyFrame() {}
+
+        fun onVideoCapabilities(hevcAllowed: Boolean) {}
+
+        fun onDisplaySize(width: Int, height: Int, maxFps: Int) {}
+        fun onViewAreaChoices(revision: Long, uuid: String, targets: IntArray) {}
+        fun onDisplayLayout(width: Int, height: Int, viewX: Int, viewY: Int, viewWidth: Int, viewHeight: Int,
+                            safeX: Int, safeY: Int, safeWidth: Int, safeHeight: Int, drawOutside: Boolean,
+                            statusBarEdge: Int, rightHandDrive: Boolean, allowsFocus: Boolean) {}
+        fun onIap2Start(id: Long, deviceId: String, deviceName: String, profileId: String) {
+            io.github.hypercar.iap2.WifiIap2Bridge.start(id, deviceId, deviceName, profileId)
+        }
+        fun onIap2Bytes(id: Long, bytes: ByteArray) { io.github.hypercar.iap2.WifiIap2Bridge.receive(id, bytes) }
+        fun onIap2ScreenSetupAccepted(id: Long) { io.github.hypercar.iap2.WifiIap2Bridge.screenSetupAccepted(id) }
+        fun onIap2Stop(id: Long) { io.github.hypercar.iap2.WifiIap2Bridge.stop(id) }
+    }
+
+    /**
+     * 车机 HID 触摸回调（Rust 工作线程调用，实现方需自行切主线程）。
+     *
+     * action：0=DOWN、1=UP、2=MOVE；x/y 已换算到编码画布像素（与 VideoConfig 画布一致）。
+     * 与 [EventListener] 分开注册：触摸是高频事件，且 UI 层可能在会话中途重建。
+     */
+    interface TouchListener {
+        fun onTouch(action: Int, x: Int, y: Int)
+    }
+
+    // Native GlobalRefs own callback lifetimes; do not keep an unused second Kotlin cache.
+    fun setListener(listener: EventListener?) = nativeSetListener(listener)
+    fun setTouchListener(listener: TouchListener?) = nativeSetTouchListener(listener)
+
+    external fun nativeInitLogger()
+
+    fun clusterMapAvailable(w: Int, h: Int) = ClusterMapEncoder.available(w, h)
+    fun clusterMapCapable() = ClusterMapEncoder.capable()
+    fun openClusterMap(w: Int, h: Int, x: Int, y: Int, sw: Int, sh: Int, fps: Int): ClusterMapEncoder? =
+        ClusterMapEncoder.open(w, h, x, y, sw, sh, fps)
+
+    /** JNI factory belongs to the stable bridge, independent of delegated session listeners. */
+    fun createCarWithTranscoder(inputHevc: Boolean, outputHevc: Boolean, width: Int, height: Int, targetWidth: Int, targetHeight: Int, fps: Int, csd: ByteArray): CarWithHevcTranscoder =
+        CarWithHevcTranscoder.open(inputHevc, outputHevc, width, height, targetWidth, targetHeight, fps, csd)
+
+    external fun nativeSetListener(listener: EventListener?)
+
+    external fun nativeSetTouchListener(listener: TouchListener?)
+
+    /**
+     * 启动全链路网关。
+     *
+     * @param configJson 引擎配置（见 rust-core/src/engine.rs 的 EngineConfig::from_json）：
+     *   device_id（本机真实蓝牙 MAC）、car_ip、airplay_port、width/height/fps（屏幕推送分辨率）、
+     *   identity_path（ed25519 长期身份落盘路径）、enable_audio、keep_alive_stats…
+     * @param controlFd Kotlin 已 connect 到 车机 AirPlay 端口（carNetwork 绑定）的 TCP FD（已 detach）
+     * @param socketProvider 后续新端口的 socket 供给
+     */
+    external fun nativeStart(configJson: String, controlFd: Int, socketProvider: SocketProvider): Boolean
+    /** Source service survives media engine retries; owner is the connection attempt. */
+    external fun nativePrepareCarWith(configJson: String, owner: Long): Boolean
+    external fun nativeStopCarWith(owner: Long)
+
+    /** Capture the native engine generation; zero means no input receiver. */
+    external fun nativeVoiceKeyToken(): Long
+    external fun nativeCancelMicrophone(token: Long): Boolean
+    /** iAP2 voice edges share the AirPlay requestSiri/HID state machine. */
+    external fun nativeSendVoiceKey(token: Long, action: Int): Boolean
+
+    external fun nativeStop()
+    /** 主动退出：有界等待 TEARDOWN 和旧引擎资源释放，不用于网络丢失或蓝牙交接。 */
+    external fun nativeStopGracefully(): Boolean
+    external fun nativeMarkWifiIap2Ready(id: Long, ready: Boolean)
+    external fun nativeSetWifiIap2Phase(id: Long, phase: String)
+    external fun nativeCanKeepWifiSession(): Boolean
+    external fun nativeSendIap2(id: Long, bytes: ByteArray, hudMessageId: Int, hudSerial: Long): Boolean
+    external fun nativeWifiIap2PeerSyn(id: Long)
+    external fun nativeSendWifiIap2Detect(id: Long): Boolean
+
+    external fun nativeRequestViewArea(revision: Long, uuid: String, target: Int): Boolean
+
+    /** Request native head-unit UI without tearing down CarPlay or its audio route. */
+    external fun nativeRequestHostUi(): Boolean
+    /** Bounded claim for a new playback action; the core preserves receiver constraints. */
+    external fun nativeRequestAudioOwnership(): Boolean
+
+    /** 投喂一帧 H.264（Annex B，本机 MediaCodec 编码输出）。[ptsUs] 为微秒时间戳。 */
+    external fun nativePushVideoFrame(data: ByteArray, ptsUs: Long)
+
+    /** Explicit actual codec: 0=H.264, 1=HEVC; Annex B access unit. */
+    external fun nativePushVideoFrameWithCodec(data: ByteArray, ptsUs: Long, codec: Int)
+
+    /** 投喂画面新尺寸（对齐 AirPlay VideoConfig）。 */
+    external fun nativeSetVideoSize(width: Int, height: Int)
+
+    /** 投喂一包 PCM（16-bit 小端交错；本机采集的音频）。 */
+    external fun nativePushAudioPcm(pcm: ShortArray, rate: Int, channels: Int)
+
+    /** UID-isolated navigation utterances, independent from continuous media PCM. */
+    external fun nativeStartNavigationAudio(rate: Int, channels: Int)
+    external fun nativePushNavigationAudioPcm(pcm: ShortArray, rate: Int, channels: Int)
+    external fun nativeStopNavigationAudio()
+
+    /** Rust 侧是否在运行（诊断）。 */
+    external fun nativeIsRunning(): Boolean
+
+}

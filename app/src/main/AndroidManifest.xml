@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 网络：车机热点（无外网）+ AirPlay 推流 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- CHANGE_NETWORK_STATE：requestNetwork（含 WifiNetworkSpecifier 与「取当前 WiFi 句柄」）
+         在 Android 11+ 上要求它或 WRITE_SETTINGS，否则直接抛
+         SecurityException: was not granted either of these permissions:
+         android.permission.CHANGE_NETWORK_STATE,android.permission.WRITE_SETTINGS
+         （2026-10-23 现场：连车机热点因此永远失败，而且系统连确认框都不弹）。普通权限，安装即授予。 -->
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="33" />
+    <!-- 位置权限：Android 12/12L 的 WifiNetworkSpecifier 兜底路径仍需要（manifest 必须成对声明） -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- 蓝牙：iAP2 RFCOMM + 上车 ACL 广播唤醒（秒连链路的第一环）。
+         BLUETOOTH_SCAN 标 neverForLocation：本项目只用 ACL 广播，不用扫描结果推断位置，
+         声明后 Android 12/12L 不再因蓝牙索要定位权限。 -->
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!-- 手动连接无 Shizuku 时才按需请求；不列入启动必需权限。 -->
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="31" />
+
+    <!-- 服务与唤醒 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_COMPANION_RUN_IN_BACKGROUND" />
+    <uses-permission android:name="android.permission.REQUEST_COMPANION_START_FOREGROUND_SERVICES_FROM_BACKGROUND" />
+    <uses-permission android:name="android.permission.REQUEST_OBSERVE_COMPANION_DEVICE_PRESENCE" />
+    <uses-feature android:name="android.software.companion_device_setup" android:required="false" />
+    <!-- 语音助手/音频采集（预留）：本机自采音频供后续推流链路使用，
+         当前仅声明权限，不采集任何音频。 -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <uses-feature
+        android:name="android.hardware.bluetooth"
+        android:required="true" />
+    <uses-feature
+        android:name="android.hardware.wifi"
+        android:required="true" />
+
+    <!-- Android 11+ 包可见性：投屏选择器只枚举有桌面入口的应用。 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent><action android:name="android.speech.RecognitionService" /></intent>
+        <package android:name="com.miui.carlink" />
+        <package android:name="com.miui.voiceassist" />
+        <package android:name="moe.shizuku.privileged.api" />
+        <package android:name="com.autonavi.minimap" />
+        <package android:name="com.baidu.BaiduMap" />
+        <package android:name="com.tencent.qqmusic" />
+        <package android:name="com.netease.cloudmusic" />
+        <package android:name="com.luna.music" />
+        <package android:name="com.kugou.android" />
+        <package android:name="cn.kuwo.player" />
+        <package android:name="com.spotify.music" />
+        <package android:name="com.apple.android.music" />
+        <package android:name="cmccwm.mobilemusic" />
+        <package android:name="com.huawei.music" />
+        <package android:name="com.ss.android.ugc.aweme" />
+        <package android:name="com.phoenix.read" />
+        <package android:name="com.smile.gifmaker" />
+        <package android:name="com.ss.android.ugc.aweme.lite" />
+        <package android:name="com.kuaishou.nebula" />
+    </queries>
+
+    <application
+        android:name=".HyperCarApp"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.HyperCar">
+
+        <!-- Shizuku binder 接收器（缺它 Shizuku 无法初始化，isReady 恒 false） -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="fullUser"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- P1：自绘车机首页。由 CarUiCaster 通过 Shizuku shell 的 am start 放到 D1 副屏，
+             故 exported=true；launchMode=singleTask 避免重复实例。 -->
+        <activity
+            android:name=".carui.CarHomeActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|uiMode"
+            android:theme="@style/Theme.HyperCar" />
+
+        <!-- P1：音乐卡片的数据源。需要用户在系统设置里授予「通知使用权」。 -->
+        <service
+            android:name=".carui.MusicNotificationListener"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <!-- Bind explicitly for automatic listening or a manual session; unlock must not auto-bind. -->
+            <meta-data
+                android:name="android.service.notification.default_autobind_listenerservice"
+                android:value="false" />
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <!-- 秒连链路：上车（车机蓝牙 ACL 连上）冷启动进程 → 前台服务 → 全自动协商 -->
+        <service
+            android:name=".autowake.HyperCarService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+        <!-- ACL 广播在隐式广播例外清单内，清单静态注册可拉起被杀进程 -->
+        <service
+            android:name=".autowake.CarCompanionService"
+            android:exported="true"
+            android:permission="android.permission.BIND_COMPANION_DEVICE_SERVICE">
+            <intent-filter>
+                <action android:name="android.companion.CompanionDeviceService" />
+            </intent-filter>
+        </service>
+
+        <receiver android:name=".autowake.AutomaticConnectionResume" android:exported="false" />
+
+        <!-- 仅 DUMP 权限（adb shell）可触发：单独验证正式的高德 LinkSDK 绑定，
+             正式 HUD 路径仍受会话/HUD 开关约束。 -->
+        <receiver
+            android:name=".debug.AmapLinkDebugReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="io.github.hypercar.DEBUG_AMAP_LINK" />
+            </intent-filter>
+        </receiver>
+
+        <receiver
+            android:name=".autowake.CarBluetoothReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.bluetooth.device.action.ACL_CONNECTED" />
+                <action android:name="android.bluetooth.device.action.ACL_DISCONNECTED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
+
