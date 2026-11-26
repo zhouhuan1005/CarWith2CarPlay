@@ -31,6 +31,11 @@ class HyperCarService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // 通过 startForegroundService 启动后，5 秒内必须调 startForeground，否则系统直接
+        // RemoteServiceException 崩进程（2026-11-25 实车日志：COMPANION 唤醒走进早退分支
+        // 只 stopSelf 未进前台，每次启动必崩一次）。先无条件进前台；早退分支随后
+        // stopForeground(REMOVE)+stopSelf 干净退场，已在前台时重复调用也无副作用。
+        startForegroundSafe()
         val automatic = intent?.action != ACTION_SESSION
         val autoEnabled = io.github.hypercar.settings.SettingsStore.autoConnect
         val paused = autoEnabled && io.github.hypercar.session.HyperCarRepo.automaticPauseRemaining > 0

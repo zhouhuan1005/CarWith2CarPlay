@@ -288,7 +288,13 @@ impl CarLifeHub {
         let hub_stop = stop.clone();
         let mut last_dialer = LAST_DIALER.lock();
         let previous = last_dialer.take();
-        *last_dialer = Some(tokio::spawn(callback_context::inherit(async move {
+        // CarWith 路径（nativePrepareCarWith → carwith_source::prepare → 本函数）没有任何
+        // callback_context 作用域，直接 spawn 会让 inherit 到 None，MEDIA 看门狗的
+        // carwith_media_silent 到不了 Kotlin（2026-11-26 实车日志定谳）。无作用域时用
+        // 全局监听器兜底建一个，拨号任务和它的全部子任务即可正常发状态事件。
+        let bootstrap = crate::ensure_callback_context();
+        let dialer = callback_context::sync_scope(bootstrap, || {
+            tokio::spawn(callback_context::inherit(async move {
             if let Some(previous) = previous { let _ = previous.await; }
             let mut throttle=DialLogThrottle::new();
             let mut startup_refusals = 0;
@@ -385,7 +391,8 @@ impl CarLifeHub {
                 emit_log(&format!("CARWITH-HS: round closed: {}",outcome.unwrap_err()));
                 tokio::select! { biased; _=stop.cancelled()=>return, _=tokio::time::sleep(Duration::from_secs(1))=>{} }
             }
-        })));
+        })) });
+        *last_dialer = Some(dialer);
         Ok((Self {stop:hub_stop,touch_state,touch_tx,encoder_size,keyframe_request},event_rx))
     }
 

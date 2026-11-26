@@ -402,6 +402,17 @@ fn call_listener(method: &str, f: impl FnOnce(&mut JNIEnv, &JObject) -> jni::err
     let _ = with_env(|env| f(env, global.as_obj()));
 }
 
+/// CarWith 预热路径（nativePrepareCarWith → carwith_source::prepare → CarLifeHub::connect）
+/// 不经过 nativeStart 的 sync_scope：task-local 的 callback_context 在那里是 None，
+/// 拨号任务 inherit 到 None 后，全部子任务（含 MEDIA 看门狗）的 emit_state 会在
+/// call_listener 里被静默丢弃（onState 无主即弃）。2026-11-26 现场证据：CarWith 会话
+/// 跑了数分钟、VIDEO 心跳连续，carwith_media_silent 却从未到达 Kotlin。
+/// 此处在无作用域时用全局监听器兜底构造 context。
+pub(crate) fn ensure_callback_context() -> callback_context::Context {
+    if let Some(context) = callback_context::current() { return context; }
+    callback_context::Context::new(LISTENER.read().clone())
+}
+
 /// Rust → Kotlin 触摸回调（action: 0=DOWN 1=UP 2=MOVE；坐标为编码画布像素）。
 ///
 /// 在 Rust 工作线程调用：`with_env` 会按需 attach（daemon）并清掉 Pending 异常。
