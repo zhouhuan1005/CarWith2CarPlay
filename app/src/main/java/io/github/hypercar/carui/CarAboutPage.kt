@@ -76,7 +76,7 @@ fun CarAboutPage(modifier: Modifier = Modifier, onBack: () -> Unit) {
         }
         Spacer(Modifier.height(10.dp))
         Text(
-            "本应用仅用于个人研究，与 BMW / Apple / 高德无隶属关系。",
+            "本应用仅用于个人研究，与 Apple / 小米 / 奥迪 无隶属关系；基于 HyperCar (GPLv3) 衍生。",
             color = CarMuted, fontSize = 12.sp,
         )
     }

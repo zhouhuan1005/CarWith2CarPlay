@@ -4331,7 +4331,7 @@ object HyperCarRepo {
             .format(java.util.Date())
         val name = "hypercar-log-$stamp.txt"
         val text = buildString {
-            appendLine("# HyperCar 调试日志  导出于 $stamp")
+            appendLine("# CarWith2CarPlay 调试日志  导出于 $stamp")
             appendLine("# 应用 ${DeviceInfo.appVersion(ctx)}")
             appendLine("# 设备 ${DeviceInfo.systemSummary()}")
             appendLine("# 说明：以下时间戳为本机时间；保留的落盘日志（含上一份轮转，读取失败时回退当前日志）共 ${logs.size} 行")

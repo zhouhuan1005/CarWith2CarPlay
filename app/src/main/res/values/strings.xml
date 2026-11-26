@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">CarWith2CarPlay</string>
-    <string name="app_author">fw867</string>
-    <string name="app_repo">github.com/fw867/hypercar</string>
+    <string name="app_author">zhouhuan1005</string>
+    <string name="app_repo">github.com/zhouhuan1005/CarWith2CarPlay</string>
     <string name="notification_channel_link">车联会话</string>
-    <string name="notification_link_title">HyperCar 运行中</string>
+    <string name="notification_link_title">CarWith2CarPlay 运行中</string>
 </resources>

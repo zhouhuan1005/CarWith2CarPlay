@@ -41,7 +41,7 @@ object RemoteProfiles {
 
     /** 档案列表地址（raw.githubusercontent.com，改 `main` 为其它分支即可灰度）。 */
     const val DEFAULT_URL =
-        "https://raw.githubusercontent.com/fw867/hypercar/main/profiles/headunits.json"
+        "https://raw.githubusercontent.com/zhouhuan1005/CarWith2CarPlay/main/profiles/headunits.json"
 
     /** 设置页可改下载源（自建镜像/私有分支），空则用 [DEFAULT_URL]。 */
     fun url(): String =

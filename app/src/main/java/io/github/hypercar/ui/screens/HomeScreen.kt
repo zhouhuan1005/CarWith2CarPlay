@@ -258,7 +258,7 @@ internal fun FirstConnectGuideCard(modifier: Modifier = Modifier) {
                         android.content.Intent(
                             android.content.Intent.ACTION_VIEW,
                             android.net.Uri.parse(
-                                "https://github.com/fw867/hypercar/blob/main/docs/HEADUNIT-PROFILES.md",
+                                "https://github.com/zhouhuan1005/CarWith2CarPlay/blob/main/docs/HEADUNIT-PROFILES.md",
                             ),
                         ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
                     )

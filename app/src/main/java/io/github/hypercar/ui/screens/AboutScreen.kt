@@ -88,21 +88,21 @@ fun AboutScreen(modifier: Modifier = Modifier) {
                 // Enlarge only the artwork inside the badge, keeping its outer bounds clipped.
                 Image(
                     painter = painterResource(R.drawable.ic_launcher_glyph),
-                    contentDescription = "HyperCar 标志",
+                    contentDescription = "CarWith2CarPlay 标志",
                     modifier = Modifier.fillMaxSize().scale(1.55f),
                 )
             }
             Spacer(modifier = Modifier.width(14.dp))
             Column {
                 Text(
-                    text = "HyperCar",
+                    text = "CarWith2CarPlay",
                     style = MaterialTheme.typography.titleLarge.copy(
                         fontFamily = FontFamily.Monospace,
                     ),
                     color = TextPrimary,
                 )
                 Text(
-                    text = "Android 无线 CarPlay 互联\n支持自绘界面与 CarWith",
+                    text = "CarWith × 奥迪 CarPlay 互联\n音频降级 · 自绘界面 · GPLv3 衍生",
                     style = MaterialTheme.typography.bodySmall,
                     color = TextSecondary,
                 )
@@ -134,12 +134,13 @@ fun AboutScreen(modifier: Modifier = Modifier) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             SectionLabel(text = "关于")
             GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
-                InfoRow(label = "作者", value = "fw867")
+                InfoRow(label = "作者", value = "zhouhuan1005")
                 InfoRow(
                     label = "开源仓库",
-                    value = "github.com/fw867/hypercar",
-                    onClick = { openUrl(context, "https://github.com/fw867/hypercar") },
+                    value = "github.com/zhouhuan1005/CarWith2CarPlay",
+                    onClick = { openUrl(context, "https://github.com/zhouhuan1005/CarWith2CarPlay") },
                 )
+                InfoRow(label = "上游致谢", value = "fw867/hypercar (GPLv3)")
                 InfoRow(label = "更新来源", value = "GitHub Releases")
             }
         }

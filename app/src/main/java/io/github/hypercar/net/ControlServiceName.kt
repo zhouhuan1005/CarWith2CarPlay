@@ -4,7 +4,7 @@ package io.github.hypercar.net
 internal object ControlServiceName {
     fun forProfile(profileId: String, phoneName: String): String {
         if (profileId != "bmw_id85") return "sender"
-        val clean = phoneName.filterNot { it.isISOControl() }.trim().ifEmpty { "HyperCar" }
+        val clean = phoneName.filterNot { it.isISOControl() }.trim().ifEmpty { "CarWith2CarPlay" }
         val result = StringBuilder()
         var bytes = 0
         var offset = 0

@@ -20,7 +20,7 @@ class ControlServiceNameTest {
 
     @Test fun controlCharactersAndBlankNamesAreSanitized() {
         assertEquals("My Phone", ControlServiceName.forProfile("bmw_id85", " \u0000My Phone\n "))
-        assertEquals("HyperCar", ControlServiceName.forProfile("bmw_id85", " \n "))
+        assertEquals("CarWith2CarPlay", ControlServiceName.forProfile("bmw_id85", " \n "))
     }
 }
 

@@ -124,7 +124,7 @@ pub(crate) fn prepare(owner:u64,cfg:&EngineConfig)->Result<(),String> {
         size: if cfg.carwith_cached_canvas { (cfg.width,cfg.height) } else { (0,0) }, ..Default::default() });
     let microphone=cfg.carwith_microphone.then(||Arc::new(crate::mic_probe::ProbeControl::for_carwith()));
     let config=CarLifeConfig{width:cfg.width,height:cfg.height,fps:cfg.carwith_fps(),bt_address:cfg.device_id.clone(),
-        bt_name:"HyperCar".into(),navigation_updates:cfg.carwith_navigation_enabled,microphone:microphone.clone()};
+        bt_name:"CarWith2CarPlay".into(),navigation_updates:cfg.carwith_navigation_enabled,microphone:microphone.clone()};
     let (hub,mut events)=CarLifeHub::connect(config,"127.0.0.1".into(),stop.clone(),Some(display.clone()),
         move |startup| crate::reopen_carwith_entry(owner, startup))?;
     let feed=Arc::new(Mutex::new(Feed::default()));let sink=feed.clone();
