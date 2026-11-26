@@ -82,6 +82,26 @@ inherit 修复后实车复测（v1.0.0.0，2026-11-25 晚）仍然一条状态�
 没有则从全局 LISTENER 兜底构造 context；`CarLifeHub::connect_to_ports` 在 spawn
 拨号任务前包一层 `sync_scope`。
 
+### 第三层坑：冻结的 context listener 会被 owner 门拦截（2026-11-26 定谳）
+
+v1.0.0.2 实车复测（2026-11-26 17:44 日志）：会话正常、MEDIA 任务活着
+（`CARWITH-CHANNEL: MEDIA reason=periodic` 每 30 秒一条，证明 tick 分支在跑），
+`carwith_media_silent` 仍未到达。同时 AirPlay 引擎自身的
+`CORE: [negotiating]/[activation]` 状态全部正常——onState 通道本身没问题。
+
+根因：全局监听器随引擎代际不断更换（每次 `nativeStart` 都 setListener 新的
+`EngineEventListener(owner=N)`），而 CarWith 七通道源在 `nativePrepareCarWith`
+时刻把 context 里的 listener **冻结**为当时的引擎监听器。看门狗 15 秒后触发时，
+该 owner 往往已被新引擎顶替，`EngineEventListener.onState` 的 owner 门把状态
+静默拦截（且拦截日志有 ≤8 条上限，超限后完全无痕）。时序证据：prepare 在
+17:31:44（owner=3 引擎已启动），看门狗 17:32 左右触发，投递链早已换代。
+
+修复（v1.0.0.3，双层）：
+- Rust：`emit_state` 对 `carwith_media_silent` / `carwith_media_live` 不走冻结
+  context，直接解析投递时刻的全局监听器（现行引擎的 listener）；
+- Kotlin：`EngineEventListener.onState` 对这两个状态绕过 owner 门，无论本
+  listener 是否仍对应现行引擎都送达 `rustListener`。
+
 ## 四、实测证据
 
 - 0.1.0.619（仅看门狗）：MEDIA 零内容 6 分钟，`carwith_media_silent` 从未出现 → 定位到上下文丢失；

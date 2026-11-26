@@ -11,6 +11,14 @@ internal class EngineEventListener(
     private val ignoredStates = java.util.concurrent.atomic.AtomicInteger()
     private fun deliver(action: () -> Unit) { gate.deliver(owner, action) }
     override fun onState(state: String, detail: String) {
+        // CarWith 音频降级状态是连接级诊断：发出它的 CarWith 七通道源在 prepare 时刻
+        // 冻结了本 listener，等看门狗触发时本引擎常已退役，owner 门会静默拦截
+        // （2026-11-26 实车定谳：carwith_media_silent 因此从未到达 rustListener）。
+        // 这两个状态无论本 listener 是否仍对应现行引擎都要送达。
+        if (state == "carwith_media_silent" || state == "carwith_media_live") {
+            target.onState(state, detail)
+            return
+        }
         if (!gate.deliver(owner) { target.onState(state, detail) } && ignoredStates.incrementAndGet() <= 8)
             target.onLog("CORE-CALLBACK: 忽略旧引擎状态 owner=$owner current=${gate.current()} state=$state")
     }

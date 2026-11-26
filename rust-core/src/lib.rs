@@ -155,6 +155,29 @@ pub(crate) fn emit_event_channel(id: u64, at: u64, cause: &str, sample: Option<&
 
 pub(crate) fn emit_state(state: &str, detail: &str) {
     log::info!("STATE engine={} {state}: {detail}", callback_context::current().map(|c|c.generation).unwrap_or(0));
+    // CarWith 音频降级状态是连接级诊断，不属于单个引擎代际：CarWith 七通道源的
+    // context 在 nativePrepareCarWith 时刻冻结（此时全局监听器往往是当时引擎的
+    // EngineEventListener），等看门狗 15 秒后真正触发时，该 owner 常已被新引擎
+    // 顶替，状态会被 Kotlin 的 owner 门静默拦截（2026-11-26 实车定谳）。
+    // 这两个状态改走全局监听器：现行引擎的 listener 在投递时刻解析，由 Kotlin
+    // 门做是否属于旧引擎的判断（carwith_media_* 在 Kotlin 侧同样绕过该门）。
+    if state == "carwith_media_silent" || state == "carwith_media_live" {
+        let guard = LISTENER.read();
+        if let Some(global) = guard.as_ref() {
+            let _ = with_env(|env| {
+                let js = env.new_string(state)?;
+                let jd = env.new_string(detail)?;
+                env.call_method(
+                    global.as_obj(),
+                    "onState",
+                    "(Ljava/lang/String;Ljava/lang/String;)V",
+                    &[(&js).into(), (&jd).into()],
+                )
+                .map(|_| ())
+            });
+        }
+        return;
+    }
     call_listener("onState", |env, obj| {
         let js = env.new_string(state)?;
         let jd = env.new_string(detail)?;
