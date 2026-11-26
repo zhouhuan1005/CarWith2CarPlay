@@ -66,11 +66,29 @@ firstMediaMonoNs=NA（136 次采样全为 NA）
 （`emit_log` 走 `onLog`，无上下文时回退全局 LISTENER，所以日志一直正常——这就是
 "日志有、状态无"假象的来源，排查时注意。）
 
+### 第二层坑：CarWith 路径根本没有作用域（2026-11-26 定谳）
+
+inherit 修复后实车复测（v1.0.0.0，2026-11-25 晚）仍然一条状态事件都没到 Kotlin。
+证据链：会话跑了数分钟、`CARLIFE: → VIDEO 心跳` 连续到 #210（说明七通道任务全部
+活着、MEDIA 客户端任务在跑），`carwith_media_silent` 却从未出现。
+
+真正的根因：**CarWith 路径的 JNI 入口就缺作用域**。调用链是
+`nativePrepareCarWith → carwith_source::prepare → CarLifeHub::connect`，
+而 `sync_scope` 只包在 `nativeStart`（AirPlay 接收端路径）里——CarWith 预热路径
+的 task-local 是 `None`，拨号任务里 `inherit` 捕获到的就是 `None`，七通道子任务
+随之全部无主。v1 的"上下文丢失"其实在这一层，v2/v3 修的是其下游。
+
+修复（v1.0.0.1）：`lib.rs` 新增 `ensure_callback_context()`——有作用域用作用域，
+没有则从全局 LISTENER 兜底构造 context；`CarLifeHub::connect_to_ports` 在 spawn
+拨号任务前包一层 `sync_scope`。
+
 ## 四、实测证据
 
 - 0.1.0.619（仅看门狗）：MEDIA 零内容 6 分钟，`carwith_media_silent` 从未出现 → 定位到上下文丢失；
 - 0.1.0.620（inherit 修复）：未上车复测；
-- 0.1.0.621（inherit + 门控外置 + 事件去重）：待实车验证（预期日志
+- 0.1.0.621 / CarWith2CarPlay 1.0.0.0（inherit + 门控外置 + 事件去重）：实车复测
+  （2026-11-25 晚）看门狗仍未触发 → 定位到 CarWith 路径顶层缺 sync_scope；
+- CarWith2CarPlay 1.0.0.1（兜底 context + FGS 崩溃修复）：待实车验证（预期日志
   `CORE: [carwith_media_silent] elapsedSec=15` → `CARWITH-FALLBACK: 系统采集已启动` → 车机出声）。
 
 ## 五、已知边界
