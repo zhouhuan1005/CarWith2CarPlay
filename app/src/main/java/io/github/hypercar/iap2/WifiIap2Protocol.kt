@@ -47,6 +47,9 @@ internal class WifiIap2Protocol(
     private var screenSetupSeen = false
     private var startupDetectTaken = false
     private var peerSynSeen = false
+    // CarPlay 会话内的 iAP2 通道进入兼容 READY 的时间点，以及是否已主动推送过媒体快照。
+    private var readyAt = 0L
+    private var compatNowPlaying = false
     private val challengeDiagnostic: String get() =
         "aa02_seq=${challengeSequence ?: "none"} aa02_ack=$challengeAcknowledged aa03_rx=$challengeResponseReceived"
     val diagnosticSummary: String get() = "phase=$diagnosticPhase pending=${engine.queuedControlPackets} outstanding=${engine.outstandingPackets} " +
@@ -178,7 +181,26 @@ internal class WifiIap2Protocol(
             log("WAIT phase=$phase remaining=${(deadline-now).coerceAtLeast(0)}ms pending=${engine.queuedControlPackets} outstanding=${engine.outstandingPackets}; RTSP write/200 does not prove peer link acceptance")
             nextWaitLog = now + 2_000
         }
-        if (started && phase != "READY" && now > deadline) fail("phase=$phase timeout")
+        if (started && phase != "READY" && now > deadline) {
+            // Audi MIB3：车机累计 ACK 了我们的 AA02（challenge 已收），却始终不回 AA03。
+            // 该通道只承载会话内的 iAP2 附属业务（媒体元数据/订阅），画面与声音走 AirPlay，
+            // 因此按兼容模式放行并继续，避免整条通道超时 FAILED 导致仪表媒体卡片无数据。
+            if (audiMib3 && phase == "CHALLENGE" && challengeAcknowledged && !challengeResponseReceived) {
+                log("AUTH COMPAT: 车机已 ACK AA02 未回 AA03；兼容放行 iAP2 通道（画面/声音不受影响）")
+                phase = "READY"
+                readyAt = now
+                media.authenticated()
+                nowPlaying.authenticated()
+                subscriptions.authenticated()
+                greetings()
+            } else fail("phase=$phase timeout")
+        }
+        if (phase == "READY" && audiMib3 && !failed && !compatNowPlaying &&
+            receivedNowPlayingStarts == 0L && readyAt > 0 && now - readyAt >= 3_000) {
+            compatNowPlaying = true
+            nowPlaying.compatPublish()
+            log("NOWPLAYING COMPAT: 车机未发 0x5000 订阅，主动推送兼容快照供仪表媒体卡片")
+        }
         if (phase == "READY" && !failed && engine.queuedControlPackets == 0 &&
             (engine.zeroRetryAndAckMode || engine.outstandingPackets < 8)) {
             subscriptions.drain().forEach { send(it.messageId, it.body) }
@@ -269,6 +291,7 @@ internal class WifiIap2Protocol(
                 }
                 send(0xaa05)
                 phase = "READY"
+                readyAt = now
                 log("READY challenge response received; compatibility result only, certificate/signature not verified")
                 greetings()
                 media.authenticated()

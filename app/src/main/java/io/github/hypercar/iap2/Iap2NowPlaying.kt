@@ -69,6 +69,10 @@ internal class Iap2NowPlayingSession(
     }
     private var authenticated = false
     private var subscribed = false
+    // 兼容推送：部分车机（Audi MIB3）在 CarPlay 会话内始终不发 0x5000 订阅，
+    // 但仍按 NowPlayingUpdate 渲染仪表媒体卡片。放行后按未订阅的 legacy 字段集主动推送，
+    // 不发封面文件传输，避免干扰未订阅通道。
+    private var compatPublish = false
     // An empty legacy Start requests the compatibility snapshot; explicit groups select fields.
     private var requested: Map<Int, Set<Int>>? = null
     private var force = false
@@ -93,6 +97,8 @@ internal class Iap2NowPlayingSession(
     }
     val hasFileWork: Boolean get() = pending != null || cancelId != null
     fun authenticated() { authenticated = true }
+    /** 车机未订阅时的主动推送（legacy 字段集，不含封面传输）。 */
+    fun compatPublish() { compatPublish = true; force = true; nextPoll = 0 }
     fun restartLink() { val wasAuthenticated = authenticated; reset(); authenticated = wasAuthenticated }
     fun reset() {
         authenticated = false; subscribed = false; requested = null; force = false; nextPoll = 0
@@ -151,14 +157,14 @@ internal class Iap2NowPlayingSession(
         if (!authenticated) return emptyList()
         val out = mutableListOf<Output>()
         expirePending(now)
-        if (subscribed && (force || now >= nextPoll)) {
+        if ((subscribed || compatPublish) && (force || now >= nextPoll)) {
             // Observe track changes, paused seeks and completed JPEG work promptly.
             // Playing progress retains its independent five-second wire cadence below.
             nextPoll = now + 100
             val np = try { snapshot() } catch (error: Exception) {
                 note("snapshot unavailable: ${error.javaClass.simpleName}"); return out
             }
-            val canTransfer = wants(0,26) && filesSupported && maxPayload >= 12
+            val canTransfer = subscribed && wants(0,26) && filesSupported && maxPayload >= 12
             val realArt = np.artwork?.takeIf { canTransfer && it.isNotEmpty() && it.size <= MAX_ARTWORK }
             val initialize = initializeArtworkWithEmptyFile && !artworkInitializationAttempted && canTransfer
             // Finish the one-time empty handshake before publishing the latest JPEG. Metadata
