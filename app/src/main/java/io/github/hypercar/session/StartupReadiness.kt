@@ -16,11 +16,8 @@ data class StartupReadiness(
         if (!bluetoothEnabled) add("开启手机蓝牙")
         if (!wifiEnabled) add("开启手机 Wi-Fi")
         if (!locationEnabled) add("开启系统定位服务")
-        when (source) {
-            "car_ui" -> if (!shizukuReady) add("安装、启动 Shizuku 并授权 HyperCar")
-            "carwith" -> if (!carWithInstalled) add("安装并启用系统 CarWith（com.miui.carlink）")
-            else -> add("选择车机画面来源")
-        }
+        // 恒定 CarWith：任何 source 值（含历史遗留 null/"car_ui"）都按 CarWith 要求判。
+        if (!carWithInstalled) add("安装并启用系统 CarWith（com.miui.carlink）")
     }
     val automaticIssues: List<String> get() = manualIssues +
         if (overlayAllowed) emptyList() else listOf("允许悬浮窗权限，以便上车自动唤醒")

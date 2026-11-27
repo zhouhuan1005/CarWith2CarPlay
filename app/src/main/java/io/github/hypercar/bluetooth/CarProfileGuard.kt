@@ -54,6 +54,43 @@ object CarProfileGuard {
     var enabled: Boolean = false
         private set
 
+    /**
+     * **会话放行**（CarWith2CarPlay 补丁，2026-11-27）：CarWith 会话建立后放行车机
+     * HFP/A2DP——蓝牙音乐/电话不再被掐。上游"只配对、不连接"策略只在 iAP2 建链前
+     * 有意义；会话已在 Wi-Fi 上跑起来后继续掐会导致车机蓝牙栈反复重试反复失败，
+     * 最终把 MMI 的配对缓存搞乱（现场症状：每次上车都要删配对重新配对才能连）。
+     * 会话结束恢复拦截（下一轮握手仍需干净通道）。
+     */
+    @Volatile
+    private var passthrough = false
+
+    /**
+     * **降级采集防双播**：CarWithAudioFallback 采集运行中只断 A2DP（手机媒体不再走
+     * 蓝牙，避免采集推流与蓝牙流同时在车机出声）；HFP 通话声道不在采集范围，放行。
+     */
+    @Volatile
+    private var a2dpOnly = false
+
+    /** 会话建立/结束时由 HyperCarRepo.onState 调用。 */
+    @Synchronized fun setPassthrough(allow: Boolean) {
+        if (passthrough == allow) return
+        passthrough = allow
+        logSink?.invoke(
+            if (allow) "BT-GUARD: 会话已建立，放行车机 HFP/A2DP（蓝牙音乐/电话不再拦截）"
+            else "BT-GUARD: 会话结束，恢复 HFP/A2DP 拦截（下一轮 iAP2 建链需干净通道）",
+        )
+    }
+
+    /** 降级采集启停时由 CarWithAudioFallback 调用。 */
+    @Synchronized fun setA2dpOnly(active: Boolean) {
+        if (a2dpOnly == active) return
+        a2dpOnly = active
+        logSink?.invoke(
+            if (active) "BT-GUARD: 降级采集运行中，仅拦截 A2DP 防双播（HFP 通话放行）"
+            else "BT-GUARD: 降级采集已停，恢复默认拦截策略",
+        )
+    }
+
     private var receiver: BroadcastReceiver? = null
     private var appContext: Context? = null
     private var logSink: ((String) -> Unit)? = null
@@ -122,6 +159,8 @@ object CarProfileGuard {
 
     @Synchronized fun stop() {
         enabled = false
+        passthrough = false
+        a2dpOnly = false
         generation.incrementAndGet()
         mainHandler.removeCallbacksAndMessages(null)
         lastEnforceAt.clear()
@@ -152,6 +191,8 @@ object CarProfileGuard {
         address: String,
         reason: String,
     ): Boolean {
+        // 会话进行中放行（CarWith2CarPlay 补丁）：蓝牙音乐/电话交给系统，不再掐。
+        if (passthrough) return false
         val target = knownCar()
         val now = SystemClock.elapsedRealtime()
         val last = lastEnforceAt[address.uppercase()] ?: 0L
@@ -168,7 +209,8 @@ object CarProfileGuard {
             // 获取 profile 代理可能等待系统回调；期间停止/换车也要取消。
             if (!enabled || epoch != generation.get() || !address.equals(knownCar(), ignoreCase = true)) return@execute
             // disconnect 只在确有音频 profile 时标记 self-drop，空操作不吞掉真正的下车事件。
-            val dropped = BtProfiles.disconnect(context, device)
+            // 降级采集运行中只断 A2DP（防采集与蓝牙双播），HFP 通话放行。
+            val dropped = BtProfiles.disconnect(context, device, a2dpOnly = a2dpOnly)
             val left = BtProfiles.stillConnected(context, address)
             logSink?.invoke(
                 "BT-GUARD: $reason → 断开 ${dropped.ifEmpty { before }.joinToString("/").ifEmpty { "无" }}" +

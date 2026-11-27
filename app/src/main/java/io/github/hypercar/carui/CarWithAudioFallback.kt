@@ -30,6 +30,8 @@ object CarWithAudioFallback {
     fun onSilent(context: Context, detail: String) {
         if (!attempted.compareAndSet(false, true)) return
         HyperCarRepo.log("CARWITH-FALLBACK: $detail → MEDIA 通道零内容，降级 Shizuku 系统采集（CarWith2CarPlay 补丁）")
+        // 采集运行中手机媒体不能再走蓝牙 A2DP（否则车机双播）；HFP 通话不受影响。
+        io.github.hypercar.bluetooth.CarProfileGuard.setA2dpOnly(true)
         runCatching { CarAudioCapture.startLegacy(context.applicationContext) }
             .onSuccess {
                 ownedCapture.set(true)
@@ -44,12 +46,14 @@ object CarWithAudioFallback {
     fun onLive(detail: String) {
         if (!attempted.getAndSet(false)) return
         HyperCarRepo.log("CARWITH-FALLBACK: $detail → 引擎通道恢复内容，停用降级采集")
+        io.github.hypercar.bluetooth.CarProfileGuard.setA2dpOnly(false)
         if (ownedCapture.getAndSet(false)) CarAudioCapture.stop()
     }
 
     /** 会话收尾：无论当前归谁，清状态并停掉由本补丁启动的采集。 */
     fun reset() {
         attempted.set(false)
+        io.github.hypercar.bluetooth.CarProfileGuard.setA2dpOnly(false)
         if (ownedCapture.getAndSet(false)) runCatching { CarAudioCapture.stop() }
     }
 }

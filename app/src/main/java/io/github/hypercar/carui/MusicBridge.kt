@@ -708,7 +708,7 @@ object MusicBridge {
     private val ticker = object : Runnable {
         override fun run() {
             if (controller != null) publish()
-            if (CarUiCaster.running && SystemClock.elapsedRealtime() - lastRefreshAt >= 5_000) choose()
+            if (HyperCarRepo.hasCurrentSession && SystemClock.elapsedRealtime() - lastRefreshAt >= 5_000) choose()
             resumeAfterReconnect()
             main.postDelayed(this, 1_000)
         }
@@ -878,7 +878,7 @@ object MusicBridge {
                 ratingType = snapshot.ratingType
                 if (target != null) registerPlayerCallback(target)
                 val key = "${target?.packageName ?: "-"}|${snapshot.count}"
-                if (CarUiCaster.running && key != lastChoiceKey) {
+                if (HyperCarRepo.hasCurrentSession && key != lastChoiceKey) {
                     lastChoiceKey = key
                     HyperCarRepo.log("MUSIC: 选中 ${target?.packageName ?: "-"}（共 ${snapshot.count} 个会话）")
                 }

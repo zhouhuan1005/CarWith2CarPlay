@@ -93,6 +93,7 @@ object BtProfiles {
     fun disconnect(
         context: Context,
         device: BluetoothDevice,
+        a2dpOnly: Boolean = false,
     ): List<String> {
         val address =
             try {
@@ -100,10 +101,14 @@ object BtProfiles {
             } catch (_: SecurityException) {
                 return emptyList()
             }
-        val before = connectedNames(context, address)
+        // 降级采集防双播模式：只处理 A2DP，HFP（通话声道）不在采集范围，保留不动。
+        val wanted = if (a2dpOnly) listOf(BluetoothProfile.A2DP) else profiles
+        val before = connectedNames(context, address).filter { name ->
+            wanted.any { profileName(it) == name }
+        }
         if (before.isEmpty()) return emptyList()
         markSelfDrop(address)
-        for (id in profiles) {
+        for (id in wanted) {
             if (profileName(id) !in before) continue
             proxy(context, id)?.let { disconnectProfile(it, device) }
         }

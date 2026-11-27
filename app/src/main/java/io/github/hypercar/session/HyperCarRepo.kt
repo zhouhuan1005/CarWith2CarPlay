@@ -24,7 +24,6 @@ import io.github.hypercar.bluetooth.shouldDiscoverForCarAcl
 import io.github.hypercar.bluetooth.DiscoverabilityHandoff
 import io.github.hypercar.bluetooth.SystemDiscoverabilityPrompt
 import io.github.hypercar.autowake.HyperCarService
-import io.github.hypercar.carui.CarUiCaster
 import io.github.hypercar.carui.MusicBridge
 import io.github.hypercar.core.AudioStats
 import io.github.hypercar.core.LinkState
@@ -543,11 +542,9 @@ object HyperCarRepo {
     /** Source eligibility. Each iAP2 link checks its peer's declaration and subscriptions. */
     @Volatile private var hudSessionEnabled = false
     internal val hudNavigationAllowed: Boolean get() = hudSessionEnabled && hasCurrentSession &&
-        sessionCarWithMode == SettingsStore.carWithMode &&
-        (sessionCarWithMode || io.github.hypercar.carui.CarUiSettings.defaultMap == io.github.hypercar.carui.MapProvider.AMAP)
-    internal val carWithHudNavigationAllowed: Boolean get() = hudNavigationAllowed && sessionCarWithMode
-    internal val mapNavigationAllowed: Boolean get() = hasCurrentSession && !sessionCarWithMode &&
-        !SettingsStore.carWithMode && io.github.hypercar.carui.CarUiSettings.defaultMap == io.github.hypercar.carui.MapProvider.AMAP
+        sessionCarWithMode == SettingsStore.carWithMode
+    internal val carWithHudNavigationAllowed: Boolean get() = false
+    internal val mapNavigationAllowed: Boolean get() = false
 
     internal fun connect(context: Context, systemPrompt: SystemDiscoverabilityPrompt? = null) =
         requestConnect(context, manual = true, source = "manual", systemPrompt = systemPrompt,
@@ -2029,12 +2026,6 @@ object HyperCarRepo {
                     // Stop only the failed media engine. Keep the same identity, Wi-Fi lease,
                     // RFCOMM session and ctrl listener/port alive for the receiver's next invite.
                     streaming = false
-                    // Keep the source service and launch alive across media activations.
-                    if (!sessionCarWithMode) {
-                        sessionUiJob?.cancel()
-                        sessionUiJob = null
-                    }
-                    CarUiCaster.stopAsync()
                     MusicBridge.onCarDisconnected()
                     // Every failed activation consumes its invitation. CAS preserves a newer
                     // invitation arriving during negotiation, even from the same address.
@@ -2207,7 +2198,6 @@ object HyperCarRepo {
         }
         val requestReceiver = PairingEvidence.receiverKey(requestPeer?.peer) ?: wifiReceiverKey()
         hudSessionEnabled = false
-        io.github.hypercar.carui.CarSpeechValidation.cancel()
         io.github.hypercar.navigation.NavigationSources.clear()
         sessionSockets?.invalidate() // 阻止旧引擎继续创建/移交 socket，先于 nativeStop。
         sessionSockets = null
@@ -2215,11 +2205,8 @@ object HyperCarRepo {
         if (!keepListening) stopForegroundService()
         MusicBridge.onCarDisconnected()
         streaming = false
-        // P1：先停自绘界面（释放 D1 显示/编码器），再停引擎。
-        // 清理涉及 shell binder/编码器释放，可能卡住；异步执行，断开流程不等它。
         sessionUiJob?.cancel()
         sessionUiJob = null
-        CarUiCaster.stopAsync()
         // 补丁（CarWith2CarPlay）：会话收尾时清理降级采集，防止跨会话残留。
         io.github.hypercar.carui.CarWithAudioFallback.reset()
         // 在解绑网络、结束蓝牙旧会话之前完成有界业务退出；断网/EOF 路径只强制清理。
@@ -3275,6 +3262,15 @@ object HyperCarRepo {
         override fun onState(state: String, detail: String) {
             val callbackOwner = engineCallbacks.current()
             log("CORE: [$state] $detail")
+            // 蓝牙放行（CarWith2CarPlay 补丁）：CarWith 会话建立后放行车机 HFP/A2DP，
+            // 蓝牙音乐/电话不再被掐（修复"断断续续 + 要删配对重连"）；会话结束恢复
+            // 拦截（下一轮 iAP2 握手仍需干净通道）。car_ui 模式（若保留）不放行，
+            // 因为音频靠系统采集，A2DP 连着会双播。
+            when (state) {
+                "connected" -> io.github.hypercar.bluetooth.CarProfileGuard.setPassthrough(sessionCarWithMode)
+                "ended", "failed", "error", "stopping" ->
+                    io.github.hypercar.bluetooth.CarProfileGuard.setPassthrough(false)
+            }
             if (!sessionLive.get() && state in setOf("activation", "negotiating", "connected", "failed", "ended")) return
             val activation = proactiveActivation.get()
             if (state in setOf("failed", "ended", "error") && activation?.interceptTerminal(detail) == true) {
@@ -3387,23 +3383,7 @@ object HyperCarRepo {
                         ),
                     )
                     // The source service already receives and caches independently.
-                    val ctx = appContext()
-                    if (ctx != null && !sessionCarWithMode) {
-                        sessionUiJob?.cancel()
-                        sessionUiJob = scope.launch {
-                            fun current() = sessionLive.get() && streaming && connectionAttemptId == diagnosticId &&
-                                engineCallbacks.current() == callbackOwner
-                            if (!current()) return@launch
-                            val result = runCatching { CarUiCaster.start(ctx, ::current) }
-                                .getOrElse { "启动失败: ${it.javaClass.simpleName}: ${it.message}" }
-                            log("CARUI: $result")
-                            if (CarUiCaster.running) {
-                                connectionDiagnostics.mark(diagnosticId, ConnectionDiagnostics.Stage.UI_STARTED)
-                                io.github.hypercar.navigation.AmapLinkProbe.start(ctx)
-                                CarUiCaster.monitor(ctx, diagnosticId, callbackOwner, ::current)
-                            }
-                        }
-                    }
+                    // 自绘车机 UI 已移除（CarWith2CarPlay）：CarWith 模式无需手机侧渲染。
                 }
                 "failed" -> {
                     MusicBridge.onCarDisconnected()
@@ -3440,7 +3420,7 @@ object HyperCarRepo {
         }
 
         override fun onForceKeyFrame() {
-            io.github.hypercar.carui.CarUiCaster.requestKeyFrame()
+            // 自绘 UI 已移除：关键帧请求由 Rust 侧 CarLifeHub 直接处理，无需手机侧转发。
         }
 
         override fun onDisplaySize(width: Int, height: Int, maxFps: Int) {
@@ -3486,7 +3466,7 @@ object HyperCarRepo {
             if (!sessionLive.get()) return
             val consoleKey = io.github.hypercar.carui.CarConsoleKey.fromInput(usage)
             if (consoleKey != null) {
-                if (!sessionCarWithMode) io.github.hypercar.carui.CarUiCaster.onConsoleKey(consoleKey)
+                // 自绘 UI 已移除：车机硬键由 Rust 侧 CarLifeHub.handle_console_key 处理。
                 return
             }
             appContext()?.let { MusicBridge.onCarMediaKey(it, usage) }
@@ -3502,10 +3482,8 @@ object HyperCarRepo {
         }
 
         override fun onVoiceAssistant() {
-            val attempt = connectionAttemptId
-            if (sessionLive.get()) io.github.hypercar.carui.CarVoiceAssistant.wake {
-                sessionLive.get() && connectionAttemptId == attempt
-            }
+            // 自绘语音面板已移除：CarWith 模式的语音助手由车机端 CarWith 自行处理。
+            if (sessionLive.get()) log("CARUI: 语音助手事件（自绘面板已移除，忽略）")
         }
 
         override fun onStats(fps: Int, frames: Long, kbps: Long, audioPlaying: Boolean, ducking: Boolean) {
@@ -4472,7 +4450,6 @@ object HyperCarRepo {
         sessionUiJob?.cancel()
         sessionUiJob = scope.launch {
             try {
-                CarUiCaster.releaseForCarWith()
                 kotlinx.coroutines.currentCoroutineContext().ensureActive()
                 if (!current()) return@launch
                 log("CARWITH: 七路守候与接收服务就绪；启动源端 attempt=$diagnosticId；独立保持至本轮连接结束")

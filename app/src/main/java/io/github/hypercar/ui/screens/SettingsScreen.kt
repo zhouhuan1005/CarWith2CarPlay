@@ -125,7 +125,6 @@ fun SettingsScreen(
     linkConnected: Boolean = false,
 ) {
     var pageName by rememberSaveable { mutableStateOf(SettingsPage.Main.name) }
-    var showProjectionApps by rememberSaveable { mutableStateOf(false) }
     val developerMode = remember(SettingsRevision.value) { SettingsStore.developerModeEnabled }
     val showDeveloperMenu = remember(SettingsRevision.value) { SettingsStore.developerMenuVisible }
     val page = SettingsPage.entries.firstOrNull { it.name == pageName }
@@ -155,10 +154,6 @@ fun SettingsScreen(
                             SettingsMenuItem("我的车机", "车机型号、目标设备与上车自动连接") { open(SettingsPage.Car) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("画面与声音", "画面来源、音频格式与显示参数") { open(SettingsPage.Display) }
-                            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-                            SettingsMenuItem("自定义投屏应用", "仅对自绘车机 UI 生效 · 已选 ${CarUiSettings.projectionPackages.size} 个") {
-                                showProjectionApps = true
-                            }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
                             SettingsMenuItem("主题与外观", "跟随系统、HyperOS 风格浅色与深色") { open(SettingsPage.Appearance) }
                             HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
@@ -198,9 +193,6 @@ fun SettingsScreen(
                 Spacer(Modifier.height(8.dp))
             }
         }
-    }
-    if (page == SettingsPage.Main && showProjectionApps) {
-        ProjectionAppsDialog { showProjectionApps = false }
     }
 }
 
@@ -1738,114 +1730,25 @@ fun CarSourceSection(
     startup: io.github.hypercar.session.StartupReadiness,
     onRefreshSetup: () -> Unit,
     connected: Boolean = false,
-    title: String = "2. 选择车机画面来源",
+    title: String = "2. 车机画面来源：CarWith",
     compact: Boolean = false,
 ) {
-    val ctx = LocalContext.current
-    val current = startup.source
-    val shizukuState = ShizukuTools.state(ctx)
-    fun selectSource(source: String) {
-        if (connected) return
-        if (source == "car_ui" && !ShizukuTools.isReady) return
-        if (source == "carwith" && !io.github.hypercar.session.StartupRequirements.carWithInstalled(ctx)) return
-        SettingsStore.carSource = source
-        io.github.hypercar.settings.SettingsRevision.bump()
-        HyperCarRepo.log("STARTUP: 画面来源=$source，重新检查启动条件")
-        onRefreshSetup()
-    }
-    if (compact) {
-        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            SectionLabel(text = title)
-            GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp)) {
-                SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                    listOf("car_ui" to "自绘车机 UI", "carwith" to "CarWith").forEachIndexed { index, (source, label) ->
-                        SegmentedButton(
-                            selected = current == source,
-                            enabled = !connected && if (source == "car_ui") startup.shizukuReady else startup.carWithInstalled,
-                            onClick = { selectSource(source) },
-                            shape = SegmentedButtonDefaults.itemShape(index = index, count = 2),
-                            label = { Text(label, style = MaterialTheme.typography.labelMedium) },
-                        )
-                    }
-                }
-                Spacer(Modifier.height(8.dp))
-                Text(when {
-                    connected -> "断开连接后可切换画面来源。"
-                    current == "carwith" -> "CarWith 画面按车机屏幕自动换算并按需拉伸，源画面最高 2560×2560，无需手动设置。"
-                    !startup.shizukuReady -> "自绘 UI 需先在「权限与后台」完成 Shizuku 授权。"
-                    else -> "自绘 UI 使用下方显示设置。"
-                }, color = TextSecondary, style = MaterialTheme.typography.bodySmall)
-                if (current == "carwith" && startup.carWithInstalled) {
-                    CarWithSettingsShortcut()
-                }
-                if (!startup.carWithInstalled) {
-                    Text("未安装系统 CarWith，此选项不可用。", color = AmberWarning,
-                        style = MaterialTheme.typography.bodySmall)
-                }
-            }
-        }
-        return
-    }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         SectionLabel(text = title)
         GlassPanel(contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp)) {
-            if (connected) {
-                Text("请先断开当前会话，再切换画面来源", color = AmberWarning,
-                    style = MaterialTheme.typography.bodySmall)
-            }
-            Text("自绘车机 UI", color = TextPrimary, style = MaterialTheme.typography.titleSmall)
-            Text(if (compact) "地图与音乐界面，需要 Shizuku 已启动并授权。"
-                else "地图、音乐卡片与 Dock。必须先完成 Shizuku 安装、启动和授权。",
-                color = TextSecondary, style = MaterialTheme.typography.bodySmall)
-            Spacer(Modifier.height(8.dp))
-            if (startup.shizukuReady) {
-                CapsuleButton(if (current == "car_ui") "已选择自绘车机 UI" else "选择自绘车机 UI",
-                    onClick = { selectSource("car_ui") }, enabled = !connected,
-                    modifier = Modifier.fillMaxWidth(), filled = current == "car_ui")
-            } else {
-                Text(when (shizukuState) {
-                    ShizukuState.NotInstalled -> "第 1 步：下载并安装 Shizuku；第 2 步：启动服务；第 3 步：授权 HyperCar。"
-                    ShizukuState.NotRunning -> "已安装：请在 Shizuku 内通过无线调试或 root 启动服务，再返回申请授权。"
-                    ShizukuState.NotGranted -> "服务已启动：请申请授权，在 Shizuku 弹窗中允许 HyperCar。"
-                    ShizukuState.Ready -> "授权已完成，正在更新状态。"
-                }, color = AmberWarning, style = MaterialTheme.typography.bodySmall)
-                Spacer(Modifier.height(8.dp))
-                CapsuleButton(when (shizukuState) {
-                    ShizukuState.NotInstalled -> "前往 GitHub 下载 Shizuku 最新版"
-                    ShizukuState.NotRunning -> "打开 Shizuku，启动服务"
-                    ShizukuState.NotGranted -> "申请 Shizuku 授权"
-                    ShizukuState.Ready -> "重新检查授权"
-                }, onClick = {
-                    when (ShizukuTools.state(ctx)) {
-                        ShizukuState.NotInstalled -> ShizukuTools.openShizukuSite(ctx)
-                        ShizukuState.NotRunning -> ShizukuTools.openShizukuApp(ctx)
-                        ShizukuState.NotGranted -> ShizukuTools.requestPermissionIfNeeded {
-                            HyperCarRepo.refreshSystemState()
-                            onRefreshSetup()
-                        }
-                        ShizukuState.Ready -> onRefreshSetup()
-                    }
-                }, modifier = Modifier.fillMaxWidth(), enabled = !connected)
-            }
-            Spacer(Modifier.height(16.dp))
-            HorizontalDivider(color = StrokeGlass.copy(alpha = 0.5f))
-            Spacer(Modifier.height(16.dp))
             Text("CarWith 模式", color = TextPrimary, style = MaterialTheme.typography.titleSmall)
-            Text(if (startup.carWithInstalled) "已检测到系统 CarWith，无需 Shizuku。未授权 Shizuku 时，入网或蓝牙可发现可能需要按系统提示确认。"
-                else "未检测到可用的系统 CarWith（com.miui.carlink），当前设备无法选择此模式。",
+            Text(if (startup.carWithInstalled) "通过小米 CarWith 推流 CarPlay 画面，无需 Shizuku。未授权 Shizuku 时，入网或蓝牙可发现可能需要按系统提示确认。"
+                else "未检测到可用的系统 CarWith（com.miui.carlink），请先安装。",
                 color = if (startup.carWithInstalled) TextSecondary else AmberWarning,
                 style = MaterialTheme.typography.bodySmall)
             Spacer(Modifier.height(8.dp))
-            CapsuleButton(if (current == "carwith") "已选择 CarWith" else "选择 CarWith",
-                onClick = { selectSource("carwith") }, enabled = !connected && startup.carWithInstalled,
-                modifier = Modifier.fillMaxWidth(), filled = current == "carwith")
             if (startup.carWithInstalled) {
                 CarWithSettingsShortcut()
             }
             if (!compact) {
-                Spacer(Modifier.height(8.dp))
-                Text("从安装或授权页面返回后会自动重新检查。", color = TextSecondary,
-                    style = MaterialTheme.typography.labelSmall)
+                Spacer(Modifier.height(4.dp))
+                Text("画面按车机屏幕自动换算并按需拉伸，源画面最高 2560×2560，无需手动设置。",
+                    color = TextSecondary, style = MaterialTheme.typography.bodySmall)
             }
         }
     }

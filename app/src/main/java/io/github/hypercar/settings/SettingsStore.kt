@@ -291,20 +291,19 @@ object SettingsStore {
         get() = p().getInt(KEY_FPS, 60)
         set(v) = p().edit().putInt(KEY_FPS, v.coerceIn(20, 60)).apply()
 
-    /** 车机画面来源（2026-11-03）：
-     *  · "car_ui"   —— 本 App 自绘车机首页（当前默认，地图卡 + 音乐卡 + Dock）
-     *  · "carwith"  —— 走小米 CarWith：拉起它的 CarLife 入口，由 CarWith 自己建显示/编码，
-     *                 我们只做 CarLife 通道 → AirPlay 的转发（需装 CarWith + 小米版 CarLife）
-     */
+    /** 车机画面来源（v1.1.0.0 起）：自绘车机 UI 已移除，恒定走小米 CarWith：
+     *  拉起它的 CarLife 入口，由 CarWith 自己建显示/编码，
+     *  我们只做 CarLife 通道 → AirPlay 的转发（需装 CarWith + 小米版 CarLife）。
+     *  保留 getter/setter 以兼容旧配置文件，值不再生效。 */
     var carSource: String
-        get() = p().getString("car_source", "car_ui") ?: "car_ui"
-        set(v) = p().edit().putString("car_source", v).apply()
+        get() = "carwith"
+        set(@Suppress("UNUSED_PARAMETER") v) {}
 
-    /** Existing explicit choices survive upgrades; fresh installs must choose a source. */
-    val carSourceSelected: Boolean get() = p().contains("car_source")
+    /** 兼容保留：CarWith 恒为已选择。 */
+    val carSourceSelected: Boolean get() = true
 
-    /** 是否 CarWith 模式。 */
-    val carWithMode: Boolean get() = carSource == "carwith"
+    /** 是否 CarWith 模式。自绘 UI 移除后恒为 true。 */
+    val carWithMode: Boolean get() = true
 
     // The retired self-rendered speech experiment also gates incoming native callbacks.
     val carVoiceRecognition: Boolean get() = false

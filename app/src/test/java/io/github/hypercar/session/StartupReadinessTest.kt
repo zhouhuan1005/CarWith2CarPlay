@@ -4,25 +4,26 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class StartupReadinessTest {
-    private val ready = StartupReadiness(source = "car_ui", shizukuReady = true, overlayAllowed = true)
+    /** v1.1.0.0 起恒定 CarWith：source 只剩 "carwith"/null（null 与 carwith 同判）。 */
+    private val ready = StartupReadiness(
+        source = "carwith", shizukuReady = false, carWithInstalled = true, overlayAllowed = true,
+    )
 
-    @Test fun firstInstallMustChooseSourceEvenWithPermissionsAndShizuku() {
-        assertFalse(ready.copy(source = null).manualReady)
-        assertFalse(ready.copy(source = "unknown").automaticReady)
-    }
-
-    @Test fun selfUiAlwaysRequiresRunningGrantedShizuku() {
-        assertTrue(ready.manualReady)
-        assertTrue(ready.automaticReady)
-        assertFalse(ready.copy(shizukuReady = false).manualReady)
-        assertFalse(ready.copy(shizukuReady = false, carWithInstalled = true).automaticReady)
+    @Test fun unknownSourceFallsBackToCarWithRequirement() {
+        // source 为 null（历史遗留）也按 CarWith 要求判。
+        assertTrue(ready.copy(source = null).manualReady)
+        assertTrue(ready.copy(source = "unknown").manualReady)
     }
 
     @Test fun carWithRequiresItsOwnPackageButNotShizuku() {
-        val carWith = ready.copy(source = "carwith", shizukuReady = false, carWithInstalled = true)
-        assertTrue(carWith.manualReady)
-        assertTrue(carWith.automaticReady)
-        assertFalse(carWith.copy(carWithInstalled = false, shizukuReady = true).manualReady)
+        assertTrue(ready.manualReady)
+        assertTrue(ready.automaticReady)
+        // Shizuku 未授权不再阻塞（CarWith 模式不需要）。
+        assertFalse(ready.copy(carWithInstalled = false).manualReady)
+        assertTrue(
+            ready.copy(carWithInstalled = false, shizukuReady = true).manualIssues
+                .contains("安装并启用系统 CarWith（com.miui.carlink）"),
+        )
     }
 
     @Test fun requiredPermissionRevocationBlocksBothEntries() {
